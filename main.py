@@ -479,11 +479,12 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                         }
                         branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
                         
-                        if branch_response.status_code not in [201, 422]:
-                            if branch_response.status_code == 422:
-                                logger.info(f"ℹ️  Ветка {branch_name} уже существует")
-                            else:
-                                logger.warning(f"⚠️ Не удалось создать ветку для PR: {branch_response.status_code}")
+                        if branch_response.status_code == 201:
+                            logger.info(f"✅ Ветка {branch_name} создана")
+                        elif branch_response.status_code == 422:
+                            logger.info(f"ℹ️  Ветка {branch_name} уже существует")
+                        else:
+                            logger.warning(f"⚠️ Не удалось создать ветку для PR: {branch_response.status_code} - {branch_response.text}")
                         
                         # Создаем PR с пустым списком файлов (файлы будут добавлены позже)
                         pr_result = create_pr_from_branch(
@@ -531,10 +532,12 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                 }
                 branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
                 
-                if branch_response.status_code not in [201, 422]:
-                    raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
-                else:
+                if branch_response.status_code == 201:
                     logger.info(f"✅ Ветка {branch_name} создана")
+                elif branch_response.status_code == 422:
+                    logger.info(f"ℹ️  Ветка {branch_name} уже существует")
+                else:
+                    raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
             
             # 7. Для каждого файла получаем код, исправляем и обновляем
             fixed_files = []
@@ -906,7 +909,33 @@ Closes #{issue_number}
                     'branch': branch_name
                 }
         
-        pr_response = requests.post(pr_url, headers=headers, json=pr_data)
+        # Проверяем существование ветки перед созданием PR
+        branch_check_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+        branch_check_response = requests.get(branch_check_url, headers=headers)
+        
+        if branch_check_response.status_code != 200:
+            # Ветка не существует, создаем её
+            logger.info(f"🌿 Ветка {branch_name} не существует, создаем её...")
+            ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+            ref_response = requests.get(ref_url, headers=headers)
+            
+            if ref_response.status_code != 200:
+                raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
+            
+            base_sha = ref_response.json()['object']['sha']
+            create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
+            branch_data = {
+                'ref': f'refs/heads/{branch_name}',
+                'sha': base_sha
+            }
+            branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
+            
+            if branch_response.status_code == 201:
+                logger.info(f"✅ Ветка {branch_name} создана")
+            elif branch_response.status_code == 422:
+                logger.info(f"ℹ️  Ветка {branch_name} уже существует")
+            else:
+                raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
         
         # Создаем PR
         pr_response = requests.post(pr_url, headers=headers, json=pr_data)
@@ -1084,20 +1113,19 @@ def auto_fix_and_create_pr(owner, repo, issue_number, technical_spec, installati
         }
         branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
         
-        if branch_response.status_code not in [201, 422]:
-            if branch_response.status_code == 422:
-                # Ветка уже существует, получаем её SHA
-                existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
-                existing_response = requests.get(existing_branch_url, headers=headers)
-                if existing_response.status_code == 200:
-                    base_sha = existing_response.json()['object']['sha']
-                    logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
-                else:
-                    raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
-            else:
-                raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
-        else:
+        if branch_response.status_code == 201:
             logger.info(f"✅ Ветка {branch_name} создана")
+        elif branch_response.status_code == 422:
+            # Ветка уже существует, получаем её SHA
+            existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+            existing_response = requests.get(existing_branch_url, headers=headers)
+            if existing_response.status_code == 200:
+                base_sha = existing_response.json()['object']['sha']
+                logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
+            else:
+                raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
+        else:
+            raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
         
         # 7. Для каждого файла получаем код, исправляем и обновляем
         fixed_files = []
@@ -1321,20 +1349,19 @@ def create_pull_request(owner, repo, file_path, fixed_code, issue_number, techni
         }
         branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
         
-        if branch_response.status_code not in [201, 422]:  # 422 если ветка уже существует
-            if branch_response.status_code == 422:
-                # Ветка уже существует, получаем её SHA
-                existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
-                existing_response = requests.get(existing_branch_url, headers=headers)
-                if existing_response.status_code == 200:
-                    base_sha = existing_response.json()['object']['sha']
-                    logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
-                else:
-                    raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
-            else:
-                raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
-        else:
+        if branch_response.status_code == 201:
             logger.info(f"✅ Ветка {branch_name} создана")
+        elif branch_response.status_code == 422:
+            # Ветка уже существует, получаем её SHA
+            existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+            existing_response = requests.get(existing_branch_url, headers=headers)
+            if existing_response.status_code == 200:
+                base_sha = existing_response.json()['object']['sha']
+                logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
+            else:
+                raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
+        else:
+            raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
         
         # Получаем SHA файла для обновления
         file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={branch_name}'
