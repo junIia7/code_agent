@@ -1846,6 +1846,17 @@ def fix_issue():
             'error': str(e)
         }), 500
 
+
+@app.route('/health', methods=['GET'])
+def health():
+    """
+    Проверка работоспособности
+    """
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat()
+    })
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     logger.info(f"🚀 Запуск GitHub Issue Analyzer Agent на порту {port}")
