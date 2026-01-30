@@ -1200,7 +1200,7 @@ def get_repository_structure(owner, repo, branch='main', installation_id=None, m
         
         commit_sha = ref_response.json()['object']['sha']
         
-        # Получаем дерево коммита
+        # Получаем дерево коммита (рекурсивно для полного анализа)
         tree_url = f'https://api.github.com/repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1'
         tree_response = requests.get(tree_url, headers=headers)
         
@@ -1210,11 +1210,21 @@ def get_repository_structure(owner, repo, branch='main', installation_id=None, m
         tree_data = tree_response.json()
         files = []
         
+        # Важные файлы и директории, которые нужно включить независимо от глубины
+        important_patterns = [
+            'package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 
+            'go.mod', 'Makefile', 'Dockerfile', '.github', 'test', 'tests', 'spec', 
+            'specs', 'pytest.ini', 'tox.ini', 'jest.config', 'vitest.config', 
+            '.mocharc', 'setup.py', 'pyproject.toml', 'tsconfig.json', 'webpack.config',
+            'docker-compose.yml', '.gitignore', 'README', 'CONTRIBUTING'
+        ]
+        
         for item in tree_data.get('tree', []):
             if item['type'] == 'blob':  # файл
                 path = item['path']
                 depth = path.count('/')
-                if depth <= max_depth or any(path.startswith(p) for p in ['package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod', 'Makefile', 'Dockerfile', '.github']):
+                # Включаем файлы до max_depth или важные файлы
+                if depth <= max_depth or any(pattern in path.lower() for pattern in important_patterns):
                     files.append({
                         'path': path,
                         'type': 'file',
@@ -1223,7 +1233,8 @@ def get_repository_structure(owner, repo, branch='main', installation_id=None, m
             elif item['type'] == 'tree':  # директория
                 path = item['path']
                 depth = path.count('/')
-                if depth <= max_depth:
+                # Включаем директории до max_depth или важные директории
+                if depth <= max_depth or any(pattern in path.lower() for pattern in important_patterns):
                     files.append({
                         'path': path,
                         'type': 'directory'
@@ -1231,7 +1242,22 @@ def get_repository_structure(owner, repo, branch='main', installation_id=None, m
         
         # Получаем содержимое ключевых файлов для определения типа проекта
         key_files = {}
-        for file_path in ['package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod', 'Makefile', 'Dockerfile', 'setup.py', 'pyproject.toml']:
+        key_file_patterns = [
+            'package.json', 'package-lock.json', 'yarn.lock',
+            'requirements.txt', 'requirements-dev.txt', 'setup.py', 'pyproject.toml', 'Pipfile',
+            'pom.xml', 'build.gradle', 'build.gradle.kts', 'settings.gradle',
+            'Cargo.toml', 'Cargo.lock',
+            'go.mod', 'go.sum',
+            'Makefile', 'Makefile.am', 'CMakeLists.txt',
+            'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
+            'tsconfig.json', 'webpack.config.js', 'vite.config.js',
+            'pytest.ini', 'tox.ini', 'setup.cfg',
+            'jest.config.js', 'jest.config.ts', 'vitest.config.js', 'vitest.config.ts',
+            '.mocharc.js', '.mocharc.json',
+            'README.md', 'README.rst', 'README.txt'
+        ]
+        
+        for file_path in key_file_patterns:
             for item in tree_data.get('tree', []):
                 if item['type'] == 'blob' and item['path'] == file_path:
                     # Получаем содержимое файла
@@ -1260,9 +1286,49 @@ def get_repository_structure(owner, repo, branch='main', installation_id=None, m
             'key_files': {}
         }
 
+def check_tests_exist(files, key_files):
+    """
+    Проверяет наличие тестов в репозитории
+    
+    Returns:
+        bool: True если тесты найдены, False если нет
+    """
+    # Паттерны для тестовых файлов и директорий
+    test_patterns = [
+        'test', 'tests', 'spec', 'specs', '__test__', '__tests__',
+        'test_', '_test', '.test.', '.spec.'
+    ]
+    
+    # Проверяем наличие тестовых директорий
+    test_dirs = [f for f in files if f['type'] == 'directory' and 
+                 any(pattern in f['path'].lower() for pattern in test_patterns)]
+    
+    # Проверяем наличие тестовых файлов
+    test_files = [f for f in files if f['type'] == 'file' and 
+                  any(pattern in f['path'].lower() for pattern in test_patterns)]
+    
+    # Проверяем package.json для npm тестов
+    if 'package.json' in key_files:
+        import json
+        try:
+            package_content = key_files['package.json']
+            if 'test' in package_content.lower() or '"test"' in package_content:
+                return True
+        except:
+            pass
+    
+    # Проверяем наличие pytest.ini, tox.ini, jest.config и т.д.
+    test_config_files = ['pytest.ini', 'tox.ini', 'jest.config.js', 'jest.config.ts', 
+                        'vitest.config.js', 'vitest.config.ts', '.mocharc.js', '.mocharc.json']
+    has_test_config = any(any(f['path'].endswith(config) for f in files if f['type'] == 'file') 
+                          for config in test_config_files)
+    
+    return len(test_dirs) > 0 or len(test_files) > 0 or has_test_config
+
 def determine_ci_commands(owner, repo, installation_id=None):
     """
     Определяет команды для сборки, тестов и проверки качества кода на основе структуры репозитория
+    Анализирует конкретный проект и определяет подходящие команды
     
     Returns:
         dict с командами для CI
@@ -1270,8 +1336,8 @@ def determine_ci_commands(owner, repo, installation_id=None):
     try:
         logger.info(f"🔍 Анализирую репозиторий {owner}/{repo} для определения CI команд...")
         
-        # Получаем структуру репозитория
-        repo_structure = get_repository_structure(owner, repo, installation_id=installation_id)
+        # Получаем структуру репозитория с большей глубиной для лучшего анализа
+        repo_structure = get_repository_structure(owner, repo, installation_id=installation_id, max_depth=3)
         
         if not repo_structure.get('success'):
             return {
@@ -1282,30 +1348,60 @@ def determine_ci_commands(owner, repo, installation_id=None):
         key_files = repo_structure.get('key_files', {})
         files = repo_structure.get('files', [])
         language = repo_structure.get('language', '')
+        default_branch = repo_structure.get('default_branch', 'main')
         
-        # Используем AI для определения команд
-        files_info = "\n".join([f"- {f['path']} ({f['type']})" for f in files[:50]])  # Первые 50 файлов
-        key_files_info = "\n".join([f"### {name}\n{content[:1000]}" for name, content in key_files.items()])
+        # Проверяем наличие тестов
+        has_tests = check_tests_exist(files, key_files)
+        logger.info(f"📋 Наличие тестов: {'✅ Найдены' if has_tests else '❌ Не найдены'}")
+        
+        # Формируем детальную информацию о структуре
+        all_files = [f['path'] for f in files if f['type'] == 'file']
+        directories = [f['path'] for f in files if f['type'] == 'directory']
+        
+        # Получаем больше информации о ключевых файлах
+        files_info = "\n".join([f"- {f['path']} ({f['type']})" for f in files[:100]])  # Первые 100 файлов
+        key_files_info = "\n".join([f"### {name}\n{content[:2000]}" for name, content in key_files.items()])
+        
+        # Детальная информация о структуре
+        structure_summary = f"""
+Директории: {', '.join(directories[:20])}
+Всего файлов: {len(all_files)}
+Язык проекта: {language}
+Основная ветка: {default_branch}
+"""
         
         prompt = f"""
 РЕПОЗИТОРИЙ: {owner}/{repo}
-ЯЗЫК: {language}
+ЯЗЫК ПРОЕКТА: {language}
+ОСНОВНАЯ ВЕТКА: {default_branch}
 
 СТРУКТУРА РЕПОЗИТОРИЯ:
+{structure_summary}
+
+СПИСОК ФАЙЛОВ И ДИРЕКТОРИЙ:
 {files_info}
 
-КЛЮЧЕВЫЕ ФАЙЛЫ:
+СОДЕРЖИМОЕ КЛЮЧЕВЫХ ФАЙЛОВ:
 {key_files_info}
 
-Проанализируй структуру репозитория и определи команды для:
-1. Сборки проекта (build command)
-2. Запуска тестов (test command)
-3. Проверки качества кода (code quality command, опционально)
+НАЛИЧИЕ ТЕСТОВ: {'Да, тесты найдены' if has_tests else 'Нет, тесты не найдены'}
+
+ВАЖНО:
+1. Проанализируй КОНКРЕТНЫЙ проект и определи команды, специфичные для этого проекта
+2. Если тестов НЕТ - установи test_command в null (НЕ включай команду запуска тестов)
+3. Если тесты ЕСТЬ - определи правильную команду для их запуска на основе структуры проекта
+4. Команды должны быть специфичны для этого конкретного проекта, а не общие
+
+Определи команды для:
+1. Сборки проекта (build_command) - ОБЯЗАТЕЛЬНО, если проект требует сборки
+2. Запуска тестов (test_command) - ТОЛЬКО если тесты найдены, иначе null
+3. Проверки качества кода (quality_command) - опционально, может быть null
+4. Рабочая директория (working_directory) - если команды нужно запускать из поддиректории
 
 Верни JSON объект в формате:
 {{
     "build_command": "команда для сборки или null",
-    "test_command": "команда для запуска тестов или null",
+    "test_command": "команда для запуска тестов или null (только если тесты есть!)",
     "quality_command": "команда для проверки качества кода или null",
     "working_directory": "директория для выполнения команд или ."
 }}
@@ -1317,7 +1413,7 @@ def determine_ci_commands(owner, repo, installation_id=None):
         response = agno_system.analyzer.client.chat.completions.create(
             model=agno_system.analyzer.model,
             messages=[
-                {"role": "system", "content": "Ты помощник, который анализирует структуру репозитория и определяет команды для сборки, тестов и проверки качества кода. Отвечай только JSON объектом."},
+                {"role": "system", "content": "Ты опытный DevOps инженер, который анализирует структуру конкретного репозитория и определяет точные команды для сборки, тестов и проверки качества кода, специфичные для этого проекта. Если тестов нет - не включай test_command. Отвечай только JSON объектом."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0
@@ -1334,7 +1430,19 @@ def determine_ci_commands(owner, repo, installation_id=None):
         import json
         try:
             commands = json.loads(commands_text)
-            logger.info(f"✅ Определены CI команды: {commands}")
+            
+            # Дополнительная проверка: если тестов нет, принудительно убираем test_command
+            if not has_tests:
+                if commands.get('test_command'):
+                    logger.info(f"⚠️ Тесты не найдены, но AI предложил test_command. Убираю его.")
+                commands['test_command'] = None
+            
+            # Валидация: если test_command есть, но тестов нет - это ошибка
+            if commands.get('test_command') and not has_tests:
+                commands['test_command'] = None
+                logger.warning(f"⚠️ Исправлено: test_command убран, так как тесты не найдены")
+            
+            logger.info(f"✅ Определены CI команды для проекта: build={bool(commands.get('build_command'))}, test={bool(commands.get('test_command'))}, quality={bool(commands.get('quality_command'))}")
             return {
                 'success': True,
                 'commands': commands
@@ -1342,7 +1450,7 @@ def determine_ci_commands(owner, repo, installation_id=None):
         except json.JSONDecodeError as e:
             logger.warning(f"⚠️ Не удалось распарсить JSON: {e}. Ответ: {commands_text}")
             # Пытаемся определить команды эвристически
-            return determine_ci_commands_heuristic(key_files, language, files)
+            return determine_ci_commands_heuristic(key_files, language, files, has_tests)
             
     except Exception as e:
         logger.error(f"❌ Ошибка при определении CI команд: {str(e)}")
@@ -1351,7 +1459,7 @@ def determine_ci_commands(owner, repo, installation_id=None):
             'error': str(e)
         }
 
-def determine_ci_commands_heuristic(key_files, language, files):
+def determine_ci_commands_heuristic(key_files, language, files, has_tests=False):
     """Эвристическое определение команд CI на основе известных паттернов"""
     commands = {
         'build_command': None,
@@ -1363,43 +1471,54 @@ def determine_ci_commands_heuristic(key_files, language, files):
     # Python
     if 'requirements.txt' in key_files or 'setup.py' in key_files or 'pyproject.toml' in key_files:
         commands['build_command'] = 'pip install -r requirements.txt' if 'requirements.txt' in key_files else 'pip install -e .'
-        commands['test_command'] = 'pytest' if any('pytest' in f['path'] or 'test' in f['path'].lower() for f in files) else 'python -m unittest discover'
+        if has_tests:
+            # Проверяем наличие pytest
+            if any('pytest' in f['path'].lower() or 'pytest.ini' in f['path'] for f in files if f['type'] == 'file'):
+                commands['test_command'] = 'pytest'
+            elif any('test' in f['path'].lower() for f in files if f['type'] == 'file'):
+                commands['test_command'] = 'python -m unittest discover'
         commands['quality_command'] = 'pylint . || true'  # || true чтобы не падало на ошибках
     
     # Node.js
     elif 'package.json' in key_files:
         commands['build_command'] = 'npm install'
-        commands['test_command'] = 'npm test'
+        if has_tests:
+            commands['test_command'] = 'npm test'
         commands['quality_command'] = 'npm run lint || true'
     
     # Java (Maven)
     elif 'pom.xml' in key_files:
         commands['build_command'] = 'mvn clean compile'
-        commands['test_command'] = 'mvn test'
+        if has_tests:
+            commands['test_command'] = 'mvn test'
         commands['quality_command'] = 'mvn checkstyle:check || true'
     
     # Java (Gradle)
     elif 'build.gradle' in key_files:
         commands['build_command'] = './gradlew build'
-        commands['test_command'] = './gradlew test'
+        if has_tests:
+            commands['test_command'] = './gradlew test'
         commands['quality_command'] = './gradlew check || true'
     
     # Rust
     elif 'Cargo.toml' in key_files:
         commands['build_command'] = 'cargo build'
-        commands['test_command'] = 'cargo test'
+        if has_tests:
+            commands['test_command'] = 'cargo test'
         commands['quality_command'] = 'cargo clippy || true'
     
     # Go
     elif 'go.mod' in key_files:
         commands['build_command'] = 'go build ./...'
-        commands['test_command'] = 'go test ./...'
+        if has_tests:
+            commands['test_command'] = 'go test ./...'
         commands['quality_command'] = 'golangci-lint run || true'
     
     # Makefile
     if any(f['path'] == 'Makefile' for f in files):
         commands['build_command'] = 'make build' if commands['build_command'] is None else commands['build_command']
-        commands['test_command'] = 'make test' if commands['test_command'] is None else commands['test_command']
+        if has_tests:
+            commands['test_command'] = 'make test' if commands['test_command'] is None else commands['test_command']
     
     return {
         'success': True,
