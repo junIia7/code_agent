@@ -306,6 +306,265 @@ def get_issue_data(owner, repo, issue_number, installation_id=None):
     else:
         raise Exception(f"Ошибка получения issue: {response.status_code} - {response.text}")
 
+def auto_fix_and_create_pr(owner, repo, issue_number, technical_spec, installation_id=None):
+    """
+    Автоматически определяет файлы для изменения, исправляет код и создает PR
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        issue_number: Номер issue
+        technical_spec: Техническое задание
+        installation_id: ID установки GitHub App (опционально)
+        
+    Returns:
+        dict с информацией о созданном PR или ошибке
+    """
+    try:
+        repo_full_name = f"{owner}/{repo}"
+        
+        # 1. Определяем файлы для изменения
+        logger.info("🔍 Определяю файлы для изменения на основе ТЗ...")
+        files_result = agno_system.determine_files_to_change(technical_spec, repo_full_name)
+        
+        if not files_result.get('success'):
+            logger.error(f"❌ Ошибка при определении файлов: {files_result.get('error')}")
+            return {
+                'success': False,
+                'error': f"Не удалось определить файлы: {files_result.get('error')}"
+            }
+        
+        files_to_change = files_result.get('files', [])
+        
+        if not files_to_change:
+            logger.warning("⚠️ Не удалось определить файлы для изменения. Пропускаю автоматическое исправление.")
+            return {
+                'success': False,
+                'error': 'Не удалось определить файлы для изменения из технического задания',
+                'technical_spec': technical_spec
+            }
+        
+        logger.info(f"📋 Найдено {len(files_to_change)} файлов для изменения: {files_to_change}")
+        
+        # 2. Получаем access token
+        if installation_id:
+            access_token = get_installation_access_token(installation_id)
+            headers = {
+                'Authorization': f'token {access_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        else:
+            personal_token = os.getenv('GITHUB_TOKEN')
+            if not personal_token:
+                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+            headers = {
+                'Authorization': f'token {personal_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        
+        # 3. Получаем информацию о репозитории
+        repo_url = f'https://api.github.com/repos/{owner}/{repo}'
+        repo_response = requests.get(repo_url, headers=headers)
+        
+        if repo_response.status_code != 200:
+            raise Exception(f"Не удалось получить информацию о репозитории: {repo_response.status_code}")
+        
+        repo_data = repo_response.json()
+        default_branch = repo_data.get('default_branch', 'main')
+        
+        # 4. Создаем имя ветки
+        branch_name = f"fix/issue-{issue_number}"
+        if len(branch_name) > 200:
+            branch_name = branch_name[:200]
+        
+        logger.info(f"🌿 Создание ветки {branch_name}...")
+        
+        # 5. Получаем SHA последнего коммита в основной ветке
+        ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+        ref_response = requests.get(ref_url, headers=headers)
+        
+        if ref_response.status_code != 200:
+            raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
+        
+        base_sha = ref_response.json()['object']['sha']
+        
+        # 6. Создаем новую ветку
+        create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
+        branch_data = {
+            'ref': f'refs/heads/{branch_name}',
+            'sha': base_sha
+        }
+        branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
+        
+        if branch_response.status_code not in [201, 422]:
+            if branch_response.status_code == 422:
+                # Ветка уже существует, получаем её SHA
+                existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+                existing_response = requests.get(existing_branch_url, headers=headers)
+                if existing_response.status_code == 200:
+                    base_sha = existing_response.json()['object']['sha']
+                    logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
+                else:
+                    raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
+            else:
+                raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
+        else:
+            logger.info(f"✅ Ветка {branch_name} создана")
+        
+        # 7. Для каждого файла получаем код, исправляем и обновляем
+        fixed_files = []
+        failed_files = []
+        
+        for file_path in files_to_change:
+            try:
+                logger.info(f"📥 Получение кода файла {file_path}...")
+                
+                # Получаем содержимое файла
+                file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={default_branch}'
+                file_response = requests.get(file_url, headers=headers)
+                
+                if file_response.status_code != 200:
+                    logger.warning(f"⚠️ Не удалось получить файл {file_path}: {file_response.status_code}")
+                    failed_files.append({'file': file_path, 'error': f'Не удалось получить файл: {file_response.status_code}'})
+                    continue
+                
+                file_data = file_response.json()
+                current_code = base64.b64decode(file_data['content']).decode('utf-8')
+                
+                # Исправляем код через агента-разработчика
+                logger.info(f"🔧 Исправление кода файла {file_path}...")
+                fix_result = agno_system.fix_code(
+                    technical_spec=technical_spec,
+                    file_path=file_path,
+                    current_code=current_code,
+                    repository_name=repo_full_name
+                )
+                
+                if not fix_result.get('success'):
+                    logger.error(f"❌ Ошибка при исправлении файла {file_path}: {fix_result.get('error')}")
+                    failed_files.append({'file': file_path, 'error': fix_result.get('error')})
+                    continue
+                
+                fixed_code = fix_result.get('fixed_code', '')
+                
+                # Обновляем файл в ветке
+                logger.info(f"📝 Обновление файла {file_path} в ветке {branch_name}...")
+                
+                # Получаем SHA файла в ветке (или создаем новый)
+                file_branch_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={branch_name}'
+                file_branch_response = requests.get(file_branch_url, headers=headers)
+                
+                file_sha = None
+                if file_branch_response.status_code == 200:
+                    file_sha = file_branch_response.json()['sha']
+                elif file_branch_response.status_code == 404:
+                    # Файл не существует в ветке, создаем новый
+                    file_sha = None
+                else:
+                    raise Exception(f"Не удалось проверить файл в ветке: {file_branch_response.status_code}")
+                
+                update_file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}'
+                update_data = {
+                    'message': f'Fix: исправление для issue #{issue_number}',
+                    'content': base64.b64encode(fixed_code.encode('utf-8')).decode('utf-8'),
+                    'branch': branch_name
+                }
+                
+                if file_sha:
+                    update_data['sha'] = file_sha
+                
+                update_response = requests.put(update_file_url, headers=headers, json=update_data)
+                
+                if update_response.status_code not in [200, 201]:
+                    raise Exception(f"Не удалось обновить файл: {update_response.status_code} - {update_response.text}")
+                
+                logger.info(f"✅ Файл {file_path} обновлен")
+                fixed_files.append(file_path)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка при обработке файла {file_path}: {str(e)}")
+                failed_files.append({'file': file_path, 'error': str(e)})
+        
+        if not fixed_files:
+            logger.error("❌ Не удалось исправить ни одного файла")
+            return {
+                'success': False,
+                'error': 'Не удалось исправить ни одного файла',
+                'failed_files': failed_files
+            }
+        
+        # 8. Создаем Pull Request
+        logger.info(f"🔀 Создание Pull Request...")
+        pr_url = f'https://api.github.com/repos/{owner}/{repo}/pulls'
+        
+        pr_title = f"Fix: решение для issue #{issue_number}"
+        files_list = '\n'.join([f"- `{f}`" for f in fixed_files])
+        pr_body = f"""## Описание
+Этот PR решает issue #{issue_number}
+
+## Изменения
+{files_list}
+
+## Техническое задание
+{technical_spec[:2000]}{'...' if len(technical_spec) > 2000 else ''}
+
+## Связанная issue
+Closes #{issue_number}
+"""
+        
+        if failed_files:
+            pr_body += f"\n## Предупреждения\nНе удалось обработать следующие файлы:\n"
+            for failed in failed_files:
+                pr_body += f"- `{failed['file']}`: {failed['error']}\n"
+        
+        pr_data = {
+            'title': pr_title,
+            'body': pr_body,
+            'head': branch_name,
+            'base': default_branch
+        }
+        
+        pr_response = requests.post(pr_url, headers=headers, json=pr_data)
+        
+        if pr_response.status_code not in [201, 422]:
+            if pr_response.status_code == 422:
+                # PR уже существует, получаем его
+                existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
+                existing_prs_response = requests.get(existing_prs_url, headers=headers)
+                if existing_prs_response.status_code == 200:
+                    existing_prs = existing_prs_response.json()
+                    if existing_prs:
+                        pr_data = existing_prs[0]
+                        logger.info(f"ℹ️  PR уже существует: {pr_data['html_url']}")
+                        return {
+                            'success': True,
+                            'pr_number': pr_data['number'],
+                            'pr_url': pr_data['html_url'],
+                            'branch': branch_name,
+                            'fixed_files': fixed_files,
+                            'failed_files': failed_files
+                        }
+            raise Exception(f"Не удалось создать PR: {pr_response.status_code} - {pr_response.text}")
+        
+        pr_data = pr_response.json()
+        logger.info(f"✅ Pull Request создан: {pr_data['html_url']}")
+        
+        return {
+            'success': True,
+            'pr_number': pr_data['number'],
+            'pr_url': pr_data['html_url'],
+            'branch': branch_name,
+            'fixed_files': fixed_files,
+            'failed_files': failed_files
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при автоматическом исправлении и создании PR: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
 def create_pull_request(owner, repo, file_path, fixed_code, issue_number, technical_spec, installation_id=None):
     """
     Создает Pull Request с исправленным кодом
@@ -686,15 +945,36 @@ def analyze_issue():
                 logger.info("=" * 80)
                 logger.info(technical_spec)
                 logger.info("=" * 80 + "\n")
+                
+                # Автоматически исправляем код и создаем PR
+                logger.info("🚀 Запускаю автоматическое исправление кода и создание PR...")
+                try:
+                    pr_result = auto_fix_and_create_pr(
+                        owner=owner,
+                        repo=repo,
+                        issue_number=issue_number,
+                        technical_spec=technical_spec,
+                        installation_id=installation_id
+                    )
+                    
+                    if pr_result.get('success'):
+                        logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')}")
+                    else:
+                        logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')}")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
+                    pr_result = None
             else:
                 logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
                 technical_spec = None
+                pr_result = None
                 
         except Exception as e:
             logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
             technical_spec = None
+            pr_result = None
         
-        return jsonify({
+        response_data = {
             'success': True,
             'repository': {
                 'name': repo,
@@ -712,7 +992,20 @@ def analyze_issue():
             },
             'technical_spec': technical_spec,
             'message': f'Issue #{issue_number} "{issue_title}" успешно проанализирована'
-        })
+        }
+        
+        if pr_result and pr_result.get('success'):
+            response_data['pull_request'] = {
+                'number': pr_result.get('pr_number'),
+                'url': pr_result.get('pr_url'),
+                'branch': pr_result.get('branch'),
+                'fixed_files': pr_result.get('fixed_files', [])
+            }
+            response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")}'
+        elif pr_result:
+            response_data['pr_error'] = pr_result.get('error')
+        
+        return jsonify(response_data)
         
     except Exception as e:
         logger.error(f"❌ Ошибка при анализе issue: {str(e)}")
@@ -791,15 +1084,51 @@ def webhook():
                     logger.info("=" * 80)
                     logger.info(technical_spec)
                     logger.info("=" * 80 + "\n")
+                    
+                    # Автоматически исправляем код и создаем PR
+                    logger.info("🚀 Запускаю автоматическое исправление кода и создание PR...")
+                    try:
+                        # Извлекаем owner и repo из repo_full_name
+                        repo_parts = repo_full_name.split('/')
+                        if len(repo_parts) == 2:
+                            repo_owner = repo_parts[0]
+                            repo_repo = repo_parts[1]
+                        else:
+                            raise ValueError(f"Неверный формат repo_full_name: {repo_full_name}")
+                        
+                        # Получаем installation_id из payload
+                        installation_id = payload.get('installation', {}).get('id')
+                        if not installation_id:
+                            installation_id = find_installation_id_for_repo(repo_owner, repo_repo)
+                        if not installation_id:
+                            installation_id = GITHUB_INSTALLATION_ID or None
+                        
+                        pr_result = auto_fix_and_create_pr(
+                            owner=repo_owner,
+                            repo=repo_repo,
+                            issue_number=issue_number,
+                            technical_spec=technical_spec,
+                            installation_id=installation_id
+                        )
+                        
+                        if pr_result.get('success'):
+                            logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')}")
+                        else:
+                            logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
+                        pr_result = None
                 else:
                     logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
                     technical_spec = None
+                    pr_result = None
                     
             except Exception as e:
                 logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
                 technical_spec = None
+                pr_result = None
             
-            return jsonify({
+            response_data = {
                 'success': True,
                 'event': 'issue_opened',
                 'repository': {
@@ -814,7 +1143,20 @@ def webhook():
                 },
                 'technical_spec': technical_spec if technical_spec else None,
                 'message': f'Issue #{issue_number} "{issue_title}" создана в репозитории {repo_full_name}'
-            })
+            }
+            
+            if pr_result and pr_result.get('success'):
+                response_data['pull_request'] = {
+                    'number': pr_result.get('pr_number'),
+                    'url': pr_result.get('pr_url'),
+                    'branch': pr_result.get('branch'),
+                    'fixed_files': pr_result.get('fixed_files', [])
+                }
+                response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")}'
+            elif pr_result:
+                response_data['pr_error'] = pr_result.get('error')
+            
+            return jsonify(response_data)
         
         # Обработка других событий репозитория
         if 'repository' in payload:
