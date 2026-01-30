@@ -908,29 +908,10 @@ Closes #{issue_number}
         
         pr_response = requests.post(pr_url, headers=headers, json=pr_data)
         
-        if pr_response.status_code not in [201, 422]:
-            if pr_response.status_code == 422:
-                # PR уже существует, получаем его
-                existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
-                existing_prs_response = requests.get(existing_prs_url, headers=headers)
-                if existing_prs_response.status_code == 200:
-                    existing_prs = existing_prs_response.json()
-                    if existing_prs:
-                        existing_pr_data = existing_prs[0]
-                        pr_num = existing_pr_data.get('number')
-                        html_url = existing_pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                        logger.info(f"ℹ️  PR уже существует: {html_url}")
-                        return {
-                            'success': True,
-                            'pr_number': pr_num,
-                            'pr_url': html_url,
-                            'branch': branch_name
-                        }
-            error_text = pr_response.text
-            logger.error(f"❌ Ошибка создания PR: {pr_response.status_code} - {error_text}")
-            raise Exception(f"Не удалось создать PR: {pr_response.status_code} - {error_text}")
-        
-        # Проверяем успешное создание PR
+        # Создаем PR
+        pr_response = requests.post(pr_url, headers=headers, json=pr_data)
+
+        # Успешное создание PR
         if pr_response.status_code == 201:
             try:
                 pr_response_data = pr_response.json()
@@ -950,10 +931,13 @@ Closes #{issue_number}
                 logger.error(f"❌ Ошибка парсинга ответа PR: {str(json_error)}")
                 logger.error(f"❌ Ответ сервера: {pr_response.text[:500]}")
                 raise Exception(f"Не удалось распарсить ответ при создании PR: {str(json_error)}")
-        else:
-            # Статус 422 - PR уже существует
+
+        # PR уже существует
+        elif pr_response.status_code == 422:
+            # Получаем существующий PR
             existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
             existing_prs_response = requests.get(existing_prs_url, headers=headers)
+            
             if existing_prs_response.status_code == 200:
                 existing_prs = existing_prs_response.json()
                 if existing_prs:
@@ -967,13 +951,22 @@ Closes #{issue_number}
                         'pr_url': html_url,
                         'branch': branch_name
                     }
-            raise Exception(f"PR уже существует, но не удалось его получить")
-        
+            
+            # Не удалось получить существующий PR
+            raise Exception("PR уже существует (статус 422), но не удалось его получить")
+
+        # Другие ошибки
+        else:
+            error_text = pr_response.text
+            logger.error(f"❌ Ошибка создания PR: {pr_response.status_code} - {error_text}")
+            raise Exception(f"Не удалось создать PR: {pr_response.status_code} - {error_text}")
+    
     except Exception as e:
         logger.error(f"❌ Ошибка при создании PR: {str(e)}")
         import traceback
         logger.error(f"❌ Детали ошибки: {traceback.format_exc()}")
         raise
+
 
 def auto_fix_and_create_pr(owner, repo, issue_number, technical_spec, installation_id=None):
     """
