@@ -1590,148 +1590,111 @@ def index():
         'description': 'AI агент для анализа GitHub issues и создания технических заданий',
         'version': '1.0.0',
         'capabilities': [
-            'Анализ GitHub issues через webhook',
-            'Прямой анализ issue по ссылке',
+            'Анализ GitHub issues',
             'Автоматическое создание технических заданий',
+            'Автоматическое исправление кода',
+            'Создание Pull Request',
             'Интеграция с LangGraph для AI анализа'
         ],
         'endpoints': {
             'GET /': 'Эта страница - информация о возможностях агента',
-            'POST /analyze': 'Анализ issue по ссылкам (repo_url и issue_url)',
-            'POST /fix-code': 'Исправление кода на основе ТЗ (technical_spec, file_path, repo_url)',
-            'POST /test-analyzer': 'Тестирование работы агента-аналитика',
-            'GET /repo/<owner>/<repo>': 'Получить информацию о репозитории',
-            'GET /health': 'Проверка работоспособности'
+            'POST /fix-issue': 'Обработка issue: анализ, создание ТЗ и автоматическое исправление с созданием PR'
         },
         'usage': {
-            'analyze_issue': {
+            'fix_issue': {
                 'method': 'POST',
-                'url': '/analyze',
+                'url': '/fix-issue',
                 'body': {
-                    'repo_url': 'https://github.com/owner/repo',
+                    'owner': 'owner',
+                    'repo': 'repo',
                     'issue_url': 'https://github.com/owner/repo/issues/1'
                 },
-                'example': 'curl -X POST http://your-server/analyze -H "Content-Type: application/json" -d \'{"repo_url": "https://github.com/owner/repo", "issue_url": "https://github.com/owner/repo/issues/1"}\''
+                'description': 'Обрабатывает issue: анализирует, создает ТЗ и автоматически исправляет код с созданием PR',
+                'example': 'curl -X POST http://your-server/fix-issue -H "Content-Type: application/json" -d \'{"owner": "owner", "repo": "repo", "issue_url": "https://github.com/owner/repo/issues/1"}\''
             }
         }
     })
 
-@app.route('/repo/<owner>/<repo>', methods=['GET'])
-def get_repo_info(owner, repo):
+@app.route('/fix-issue', methods=['POST'])
+def fix_issue():
     """
-    Получает информацию о репозитории
-    """
-    try:
-        # Проверяем, передан ли installation_id явно
-        installation_id = request.args.get('installation_id')
-        
-        # Если не передан, пытаемся найти автоматически
-        if not installation_id:
-            logger.info(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
-            installation_id = find_installation_id_for_repo(owner, repo)
-        
-        # Если не нашли автоматически, используем значение из .env (если есть)
-        if not installation_id:
-            installation_id = GITHUB_INSTALLATION_ID or None
-        
-        repo_info = get_repository_name(owner, repo, installation_id)
-        return jsonify({
-            'success': True,
-            'repository': repo_info
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/analyze', methods=['POST', 'GET'])
-def analyze_issue():
-    """
-    Анализирует issue по ссылкам на репозиторий и issue
-    Поддерживает как POST (JSON), так и GET (query parameters)
+    Обрабатывает issue: анализирует, создает ТЗ и автоматически исправляет код с созданием PR
+    Работает аналогично webhook при создании issue
+    
+    Принимает:
+    - owner: владелец репозитория
+    - repo: название репозитория
+    - issue_url: ссылка на issue (можно использовать вместо owner/repo)
     """
     try:
-        # Поддержка GET запросов с query parameters
-        if request.method == 'GET':
-            repo_url = request.args.get('repo_url')
-            issue_url = request.args.get('issue_url')
-            
-            # Если передан только issue_url, извлекаем repo из него
-            if issue_url and not repo_url:
-                parsed = parse_github_url(issue_url)
-                repo_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}"
+        data = request.get_json() or {}
+        
+        # Получаем параметры
+        owner = data.get('owner')
+        repo = data.get('repo')
+        issue_url = data.get('issue_url')
+        
+        # Если передан issue_url, извлекаем owner, repo и issue_number из него
+        if issue_url:
+            try:
+                issue_parsed = parse_github_url(issue_url)
+                if not owner:
+                    owner = issue_parsed['owner']
+                if not repo:
+                    repo = issue_parsed['repo']
+                issue_number = issue_parsed['issue_number']
+                
+                if not issue_number:
+                    return jsonify({
+                        'success': False,
+                        'error': 'В ссылке issue_url должен быть указан номер issue'
+                    }), 400
+            except ValueError as e:
+                return jsonify({
+                    'success': False,
+                    'error': f'Ошибка парсинга issue_url: {str(e)}'
+                }), 400
         else:
-            # POST запрос с JSON
-            data = request.get_json() or {}
-            repo_url = data.get('repo_url')
-            issue_url = data.get('issue_url')
-            
-            # Если передан только issue_url, извлекаем repo из него
-            if issue_url and not repo_url:
-                parsed = parse_github_url(issue_url)
-                repo_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}"
-        
-        # Проверяем обязательные параметры
-        if not issue_url:
-            return jsonify({
-                'success': False,
-                'error': 'Необходимо указать issue_url (ссылка на issue)'
-            }), 400
-        
-        # Парсим ссылки
-        try:
-            issue_parsed = parse_github_url(issue_url)
-            repo_parsed = parse_github_url(repo_url) if repo_url else issue_parsed
-            
-            owner = issue_parsed['owner']
-            repo = issue_parsed['repo']
-            issue_number = issue_parsed['issue_number']
-            
+            # Если issue_url не передан, нужно получить issue_number из данных
+            issue_number = data.get('issue_number')
             if not issue_number:
                 return jsonify({
                     'success': False,
-                    'error': 'В ссылке issue_url должен быть указан номер issue'
+                    'error': 'Необходимо указать либо issue_url, либо issue_number вместе с owner и repo'
                 }), 400
-                
-        except ValueError as e:
+        
+        # Проверяем обязательные параметры
+        if not owner or not repo:
             return jsonify({
                 'success': False,
-                'error': f'Ошибка парсинга URL: {str(e)}'
+                'error': 'Необходимо указать owner и repo, либо issue_url'
             }), 400
         
-        # Автоматически определяем installation_id для репозитория
-        # Сначала проверяем, не передан ли он явно (для обратной совместимости)
-        installation_id = None
-        if request.method == 'GET':
-            installation_id = request.args.get('installation_id')
-        elif request.is_json:
-            installation_id = request.json.get('installation_id')
+        repo_full_name = f"{owner}/{repo}"
         
-        # Если не передан явно, пытаемся найти автоматически
+        # Автоматически определяем installation_id для репозитория
+        installation_id = data.get('installation_id')
         if not installation_id:
             logger.info(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
             installation_id = find_installation_id_for_repo(owner, repo)
-        
-        # Если не нашли автоматически, используем значение из .env (если есть)
         if not installation_id:
             installation_id = GITHUB_INSTALLATION_ID or None
         
+        # Получаем данные issue
         logger.info(f"🔍 Получение данных issue #{issue_number} из {owner}/{repo}...")
         issue_data = get_issue_data(owner, repo, issue_number, installation_id)
         
-        repo_full_name = f"{owner}/{repo}"
         issue_title = issue_data['title']
         issue_body = issue_data['body'] or ''
         
-        # Выводим информацию в логи
-        logger.info("=" * 80)
-        logger.info(f"📝 АНАЛИЗ ISSUE (прямой запрос)")
+        # Выводим в логи имя репозитория и название issue
+        logger.info("=" * 60)
+        logger.info(f"📝 ОБРАБОТКА ISSUE (fix-issue endpoint)")
         logger.info(f"📦 Репозиторий: {repo}")
         logger.info(f"🔗 Полное имя: {repo_full_name}")
         logger.info(f"#️⃣  Номер issue: #{issue_number}")
         logger.info(f"📌 Название issue: {issue_title}")
-        logger.info("=" * 80)
+        logger.info("=" * 60)
         
         # Анализируем issue и создаем ТЗ через AGNO агента
         logger.info("\n🤖 Анализирую issue и создаю техническое задание...")
@@ -1818,30 +1781,29 @@ def analyze_issue():
                 logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
                 technical_spec = None
                 pr_result = None
+                ci_before = None
                 
         except Exception as e:
             logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
             technical_spec = None
             pr_result = None
+            ci_before = None
         
         response_data = {
             'success': True,
+            'event': 'issue_fixed',
             'repository': {
                 'name': repo,
-                'full_name': repo_full_name,
-                'url': f'https://github.com/{repo_full_name}'
+                'full_name': repo_full_name
             },
             'issue': {
                 'number': issue_number,
                 'title': issue_title,
-                'body': issue_body,
-                'url': issue_data['url'],
-                'state': issue_data['state'],
-                'created_at': issue_data['created_at'],
-                'author': issue_data['user']
+                'url': issue_data.get('url', f'https://github.com/{repo_full_name}/issues/{issue_number}'),
+                'body': issue_body
             },
-            'technical_spec': technical_spec,
-            'message': f'Issue #{issue_number} "{issue_title}" успешно проанализирована'
+            'technical_spec': technical_spec if technical_spec else None,
+            'message': f'Issue #{issue_number} "{issue_title}" обработана в репозитории {repo_full_name}'
         }
         
         if pr_result and pr_result.get('success'):
@@ -1868,7 +1830,7 @@ def analyze_issue():
                     'issues': pr_result['review'].get('issues', [])
                 }
         
-        if 'ci_before' in locals() and ci_before:
+        if ci_before:
             response_data['ci_before'] = {
                 'build_passed': ci_before.get('summary', {}).get('build_passed'),
                 'test_passed': ci_before.get('summary', {}).get('test_passed'),
@@ -1878,493 +1840,11 @@ def analyze_issue():
         return jsonify(response_data)
         
     except Exception as e:
-        logger.error(f"❌ Ошибка при анализе issue: {str(e)}")
+        logger.error(f"❌ Ошибка при обработке issue: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """
-    Обработчик webhook от GitHub
-    """
-    try:
-        # Получаем сырое тело запроса для проверки подписи
-        payload_body = request.get_data()
-        
-        # Проверяем подпись webhook
-        signature_header = request.headers.get('X-Hub-Signature-256')
-        if not verify_webhook_signature(payload_body, signature_header):
-            logger.error("❌ Ошибка: Неверная подпись webhook")
-            return jsonify({
-                'error': 'Неверная подпись webhook'
-            }), 401
-        
-        # Парсим JSON payload
-        payload = request.json
-        event_type = request.headers.get('X-GitHub-Event')
-        
-        logger.info(f"📥 Получено событие: {event_type}")
-        
-        # Обработка установки GitHub App
-        if event_type == 'installation' and payload.get('action') == 'created':
-            installation_id = payload['installation']['id']
-            logger.info(f"✅ GitHub App установлен! Installation ID: {installation_id}")
-            return jsonify({
-                'message': f'GitHub App установлен! Installation ID: {installation_id}',
-                'installation_id': installation_id
-            })
-        
-        # Обработка создания issue
-        if event_type == 'issues' and payload.get('action') == 'opened':
-            issue = payload.get('issue', {})
-            repository = payload.get('repository', {})
-            
-            repo_name = repository.get('name', 'Неизвестный репозиторий')
-            repo_full_name = repository.get('full_name', 'Неизвестный репозиторий')
-            issue_title = issue.get('title', 'Без названия')
-            issue_body = issue.get('body', '')
-            issue_number = issue.get('number', '?')
-            
-            # Выводим в логи имя репозитория и название issue
-            logger.info("=" * 60)
-            logger.info(f"📝 СОЗДАНА НОВАЯ ISSUE")
-            logger.info(f"📦 Репозиторий: {repo_name}")
-            logger.info(f"🔗 Полное имя: {repo_full_name}")
-            logger.info(f"#️⃣  Номер issue: #{issue_number}")
-            logger.info(f"📌 Название issue: {issue_title}")
-            logger.info("=" * 60)
-            
-            # Анализируем issue и создаем ТЗ через AGNO агента
-            logger.info("\n🤖 Анализирую issue и создаю техническое задание...")
-            try:
-                analysis_result = agno_system.analyze_issue(
-                    issue_title=issue_title,
-                    issue_body=issue_body,
-                    repository_name=repo_full_name
-                )
-                
-                if analysis_result.get('success'):
-                    technical_spec = analysis_result.get('technical_spec', '')
-                    
-                    # Выводим ТЗ в логи
-                    logger.info("\n" + "=" * 80)
-                    logger.info("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
-                    logger.info("=" * 80)
-                    logger.info(technical_spec)
-                    logger.info("=" * 80 + "\n")
-                    
-                    # Извлекаем owner и repo из repo_full_name
-                    repo_parts = repo_full_name.split('/')
-                    if len(repo_parts) == 2:
-                        repo_owner = repo_parts[0]
-                        repo_repo = repo_parts[1]
-                    else:
-                        raise ValueError(f"Неверный формат repo_full_name: {repo_full_name}")
-                    
-                    # Получаем installation_id из payload
-                    installation_id = payload.get('installation', {}).get('id')
-                    if not installation_id:
-                        installation_id = find_installation_id_for_repo(repo_owner, repo_repo)
-                    if not installation_id:
-                        installation_id = GITHUB_INSTALLATION_ID or None
-                    
-                    # Запускаем CI анализ репозитория
-                    logger.info("🔍 Анализирую репозиторий и определяю CI команды...")
-                    ci_commands_result = determine_ci_commands(repo_owner, repo_repo, installation_id)
-                    
-                    if not ci_commands_result.get('success'):
-                        logger.warning(f"⚠️ Не удалось определить CI команды: {ci_commands_result.get('error')}")
-                        ci_commands = {}
-                        ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
-                    else:
-                        ci_commands = ci_commands_result.get('commands', {})
-                        logger.info(f"✅ Определены CI команды: {ci_commands}")
-                        
-                        # Запускаем CI на основной ветке (до изменений)
-                        logger.info("🧪 Запуск CI на основной ветке (до изменений)...")
-                        repo_url = f'https://api.github.com/repos/{repo_owner}/{repo_repo}'
-                        if installation_id:
-                            access_token = get_installation_access_token(installation_id)
-                            repo_headers = {
-                                'Authorization': f'token {access_token}',
-                                'Accept': 'application/vnd.github.v3+json'
-                            }
-                        else:
-                            personal_token = os.getenv('GITHUB_TOKEN')
-                            repo_headers = {
-                                'Authorization': f'token {personal_token}',
-                                'Accept': 'application/vnd.github.v3+json'
-                            }
-                        repo_response = requests.get(repo_url, headers=repo_headers)
-                        default_branch = 'main'
-                        if repo_response.status_code == 200:
-                            default_branch = repo_response.json().get('default_branch', 'main')
-                        
-                        ci_before = run_ci_commands(repo_owner, repo_repo, default_branch, ci_commands, installation_id)
-                        if not ci_before.get('success'):
-                            logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
-                            ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
-                        else:
-                            logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
-                    
-                    # Автоматически исправляем код, проверяем через Reviewer и создаем PR
-                    logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
-                    try:
-                        pr_result = auto_fix_and_create_pr_with_review(
-                            owner=repo_owner,
-                            repo=repo_repo,
-                            issue_number=issue_number,
-                            issue_title=issue_title,
-                            issue_body=issue_body,
-                            technical_spec=technical_spec,
-                            ci_commands=ci_commands,
-                            ci_before=ci_before,
-                            installation_id=installation_id,
-                            max_iterations=10
-                        )
-                        
-                        if pr_result.get('success'):
-                            logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')} (итераций: {pr_result.get('iteration', 1)})")
-                        else:
-                            logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')} (итераций: {pr_result.get('iteration', 0)})")
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
-                        pr_result = None
-                else:
-                    logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
-                    technical_spec = None
-                    pr_result = None
-                    ci_before = None
-                    
-            except Exception as e:
-                logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
-                technical_spec = None
-                pr_result = None
-                ci_before = None
-            
-            response_data = {
-                'success': True,
-                'event': 'issue_opened',
-                'repository': {
-                    'name': repo_name,
-                    'full_name': repo_full_name
-                },
-                'issue': {
-                    'number': issue_number,
-                    'title': issue_title,
-                    'url': issue.get('html_url', ''),
-                    'body': issue_body
-                },
-                'technical_spec': technical_spec if technical_spec else None,
-                'message': f'Issue #{issue_number} "{issue_title}" создана в репозитории {repo_full_name}'
-            }
-            
-            if pr_result and pr_result.get('success'):
-                response_data['pull_request'] = {
-                    'number': pr_result.get('pr_number'),
-                    'url': pr_result.get('pr_url'),
-                    'branch': pr_result.get('branch'),
-                    'fixed_files': pr_result.get('fixed_files', []),
-                    'iteration': pr_result.get('iteration', 1)
-                }
-                if pr_result.get('review'):
-                    response_data['review'] = {
-                        'approved': pr_result['review'].get('approved'),
-                        'reason': pr_result['review'].get('reason')
-                    }
-                response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")} (итераций: {pr_result.get("iteration", 1)})'
-            elif pr_result:
-                response_data['pr_error'] = pr_result.get('error')
-                response_data['pr_iteration'] = pr_result.get('iteration', 0)
-                if pr_result.get('review'):
-                    response_data['review'] = {
-                        'approved': pr_result['review'].get('approved'),
-                        'reason': pr_result['review'].get('reason'),
-                        'issues': pr_result['review'].get('issues', [])
-                    }
-            
-            if ci_before:
-                response_data['ci_before'] = {
-                    'build_passed': ci_before.get('summary', {}).get('build_passed'),
-                    'test_passed': ci_before.get('summary', {}).get('test_passed'),
-                    'quality_passed': ci_before.get('summary', {}).get('quality_passed')
-                }
-            
-            return jsonify(response_data)
-        
-        # Обработка других событий репозитория
-        if 'repository' in payload:
-            repo = payload['repository']
-            repo_name = repo.get('name')
-            repo_full_name = repo.get('full_name')
-            
-            logger.info(f"📦 Событие {event_type} для репозитория: {repo_full_name}")
-            
-            return jsonify({
-                'event': event_type,
-                'repository_name': repo_name,
-                'repository_full_name': repo_full_name,
-                'message': f'Получено событие {event_type} для репозитория {repo_full_name}'
-            })
-        
-        logger.info(f"ℹ️  Необработанное событие: {event_type}")
-        return jsonify({
-            'event': event_type,
-            'message': 'Webhook получен'
-        })
-    except Exception as e:
-        logger.error(f"❌ Ошибка обработки webhook: {str(e)}")
-        return jsonify({
-            'error': str(e)
-        }), 500
-
-@app.route('/fix-code', methods=['POST'])
-def fix_code():
-    """
-    Исправляет код на основе технического задания через агента-разработчика
-    """
-    try:
-        data = request.get_json() or {}
-        
-        technical_spec = data.get('technical_spec')
-        file_path = data.get('file_path')
-        repo_url = data.get('repo_url')
-        issue_url = data.get('issue_url')
-        issue_number = data.get('issue_number')
-        owner = data.get('owner')
-        repo = data.get('repo')
-        
-        # Парсим repo_url если передан
-        if repo_url and not owner:
-            try:
-                parsed = parse_github_url(repo_url)
-                owner = parsed['owner']
-                repo = parsed['repo']
-            except ValueError as e:
-                return jsonify({
-                    'success': False,
-                    'error': f'Ошибка парсинга repo_url: {str(e)}'
-                }), 400
-        
-        # Парсим issue_url для получения issue_number
-        if issue_url and not issue_number:
-            try:
-                parsed = parse_github_url(issue_url)
-                issue_number = parsed.get('issue_number')
-                if not owner:
-                    owner = parsed['owner']
-                    repo = parsed['repo']
-            except ValueError:
-                pass  # Игнорируем ошибку, если issue_number не найден
-        
-        if not all([technical_spec, file_path, owner, repo]):
-            return jsonify({
-                'success': False,
-                'error': 'Необходимы параметры: technical_spec, file_path, owner, repo (или repo_url)'
-            }), 400
-        
-        if not issue_number:
-            return jsonify({
-                'success': False,
-                'error': 'Необходим issue_number или issue_url для создания PR'
-            }), 400
-        
-        # Автоматически определяем installation_id
-        installation_id = find_installation_id_for_repo(owner, repo)
-        if not installation_id:
-            installation_id = GITHUB_INSTALLATION_ID or None
-        
-        # Получаем текущий код файла через GitHub API
-        logger.info(f"📥 Получение кода файла {file_path} из {owner}/{repo}...")
-        try:
-            if installation_id:
-                access_token = get_installation_access_token(installation_id)
-                headers = {
-                    'Authorization': f'token {access_token}',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-            else:
-                personal_token = os.getenv('GITHUB_TOKEN')
-                if not personal_token:
-                    raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-                headers = {
-                    'Authorization': f'token {personal_token}',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-            
-            # Получаем содержимое файла
-            file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}'
-            file_response = requests.get(file_url, headers=headers)
-            
-            if file_response.status_code != 200:
-                return jsonify({
-                    'success': False,
-                    'error': f'Не удалось получить файл: {file_response.status_code} - {file_response.text}'
-                }), 400
-            
-            file_data = file_response.json()
-            current_code = base64.b64decode(file_data['content']).decode('utf-8')
-            
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'Ошибка получения файла: {str(e)}'
-            }), 500
-        
-        # Исправляем код через агента-разработчика
-        logger.info(f"🔧 Исправление кода файла {file_path}...")
-        fix_result = agno_system.fix_code(
-            technical_spec=technical_spec,
-            file_path=file_path,
-            current_code=current_code,
-            repository_name=f"{owner}/{repo}"
-        )
-        
-        if fix_result.get('success'):
-            fixed_code = fix_result.get('fixed_code', '')
-            
-            logger.info("=" * 80)
-            logger.info(f"✅ КОД ИСПРАВЛЕН для файла {file_path}")
-            logger.info("=" * 80)
-            logger.info(fixed_code)
-            logger.info("=" * 80)
-            
-            # Создаем Pull Request
-            pr_result = None
-            try:
-                logger.info(f"🔀 Создание Pull Request для issue #{issue_number}...")
-                pr_result = create_pull_request(
-                    owner=owner,
-                    repo=repo,
-                    file_path=file_path,
-                    fixed_code=fixed_code,
-                    issue_number=issue_number,
-                    technical_spec=technical_spec,
-                    installation_id=installation_id
-                )
-                logger.info(f"✅ Pull Request успешно создан: {pr_result.get('pr_url', 'N/A')}")
-            except Exception as e:
-                logger.error(f"⚠️ Ошибка при создании PR: {str(e)}")
-                # Не прерываем выполнение, возвращаем результат исправления кода
-            
-            response_data = {
-                'success': True,
-                'file_path': file_path,
-                'fixed_code': fixed_code,
-                'repository': f"{owner}/{repo}",
-                'message': f'Код файла {file_path} успешно исправлен'
-            }
-            
-            if pr_result and pr_result.get('success'):
-                response_data['pull_request'] = {
-                    'number': pr_result.get('pr_number'),
-                    'url': pr_result.get('pr_url'),
-                    'branch': pr_result.get('branch')
-                }
-                response_data['message'] = f'Код исправлен и Pull Request создан: {pr_result.get("pr_url")}'
-            
-            return jsonify(response_data)
-        else:
-            return jsonify({
-                'success': False,
-                'error': fix_result.get('error', 'Неизвестная ошибка')
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка при исправлении кода: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/test-analyzer', methods=['POST', 'GET'])
-def test_analyzer():
-    """
-    Тестовый endpoint для проверки работы агента-аналитика
-    """
-    try:
-        # Тестовые данные
-        if request.method == 'POST':
-            data = request.get_json() or {}
-            test_title = data.get('title', 'Тестовая issue')
-            test_body = data.get('body', 'Это тестовое описание issue для проверки работы модели анализа.')
-            test_repo = data.get('repository', 'test/repo')
-        else:
-            test_title = 'Тестовая issue'
-            test_body = 'Это тестовое описание issue для проверки работы модели анализа.'
-            test_repo = 'test/repo'
-        
-        logger.info("🧪 Тестирование агента-аналитика...")
-        
-        # Проверяем настройки
-        api_key = os.getenv('OPENAI_API_KEY')
-        base_url = os.getenv('OPENAI_BASE_URL', '')
-        use_deepseek = os.getenv('USE_DEEPSEEK', '').lower() in ('true', '1', 'yes')
-        model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
-        
-        config_info = {
-            'api_key_set': bool(api_key),
-            'api_key_length': len(api_key) if api_key else 0,
-            'base_url': base_url or 'default (OpenAI)',
-            'use_deepseek': use_deepseek,
-            'model': model
-        }
-        
-        if not api_key:
-            return jsonify({
-                'success': False,
-                'error': 'OPENAI_API_KEY не установлен',
-                'config': config_info
-            }), 400
-        
-        # Тестируем анализ
-        result = agno_system.analyze_issue(
-            issue_title=test_title,
-            issue_body=test_body,
-            repository_name=test_repo
-        )
-        
-        if result.get('success'):
-            technical_spec = result.get('technical_spec', '')
-            return jsonify({
-                'success': True,
-                'config': config_info,
-                'test_input': {
-                    'title': test_title,
-                    'body': test_body,
-                    'repository': test_repo
-                },
-                'result': {
-                    'technical_spec': technical_spec,
-                    'spec_length': len(technical_spec)
-                },
-                'message': 'Агент-аналитик работает корректно'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'config': config_info,
-                'error': result.get('error', 'Неизвестная ошибка')
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка при тестировании: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    """
-    Проверка работоспособности
-    """
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat()
-    })
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
