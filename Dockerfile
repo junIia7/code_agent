@@ -7,6 +7,7 @@ WORKDIR /app
 # Устанавливаем системные зависимости (если нужны)
 RUN apt-get update && apt-get install -y \
     gcc \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем файл зависимостей
