@@ -5,6 +5,7 @@ import os
 import logging
 from typing import Dict, Optional
 from openai import OpenAI
+import httpx
 
 logger = logging.getLogger('github-app')
 
@@ -16,27 +17,67 @@ class AGNOAgent:
         self.role = role
         self.instructions = instructions
         
-        # Поддержка DeepSeek и других OpenAI-совместимых API
+        # Поддержка OpenAI, DeepSeek, OpenRouter и других OpenAI-совместимых API
         api_key = os.getenv('OPENAI_API_KEY')
-        base_url = os.getenv('OPENAI_BASE_URL')
+        base_url = os.getenv('OPENAI_BASE_URL', '').strip()
         
-        # Если base_url не указан, но ключ похож на DeepSeek, используем DeepSeek endpoint
+        # Проверка наличия API ключа
+        if not api_key:
+            logger.warning(f"⚠️  {name}: OPENAI_API_KEY не установлен")
+        
+        # Если base_url не указан, проверяем автоматические настройки
         if not base_url and api_key:
-            # DeepSeek ключи обычно начинаются с 'sk-' и имеют определенную длину
-            # Но лучше проверить через переменную окружения
+            # Проверяем USE_DEEPSEEK
             if os.getenv('USE_DEEPSEEK', '').lower() in ('true', '1', 'yes'):
                 base_url = 'https://api.deepseek.com'
+                logger.info(f"🔧 {name}: Используется DeepSeek API")
+            # Проверяем USE_OPENROUTER
+            elif os.getenv('USE_OPENROUTER', '').lower() in ('true', '1', 'yes'):
+                base_url = 'https://openrouter.ai/api/v1'
+                logger.info(f"🔧 {name}: Используется OpenRouter API")
         
         # Создаем клиент с поддержкой кастомного base_url
         client_kwargs = {'api_key': api_key}
         if base_url:
             client_kwargs['base_url'] = base_url
+            logger.info(f"🔧 {name}: Base URL установлен: {base_url}")
         
-        self.client = OpenAI(**client_kwargs)
+        # OpenRouter требует HTTP-Referer заголовок (опционально, но рекомендуется)
+        http_referer = None
+        if base_url and 'openrouter' in base_url.lower():
+            http_referer = os.getenv('OPENROUTER_HTTP_REFERER', '')
+            if http_referer:
+                logger.info(f"🔧 {name}: OpenRouter HTTP-Referer: {http_referer}")
+        
+        try:
+            # Для OpenRouter добавляем кастомные заголовки через httpx клиент
+            if base_url and 'openrouter' in base_url.lower():
+                # Создаем httpx клиент с кастомными заголовками для OpenRouter
+                headers = {}
+                if http_referer:
+                    headers['HTTP-Referer'] = http_referer
+                headers['X-Title'] = 'GitHub Issue Analyzer Agent'
+                
+                http_client = httpx.Client(headers=headers)
+                client_kwargs['http_client'] = http_client
+                logger.info(f"🔧 {name}: Настроен HTTP клиент с заголовками для OpenRouter")
+            
+            self.client = OpenAI(**client_kwargs)
+        except Exception as e:
+            logger.error(f"❌ {name}: Ошибка при создании OpenAI клиента: {str(e)}")
+            raise
         
         # Модель по умолчанию зависит от провайдера
-        default_model = 'gpt-4o-mini' if not base_url or 'deepseek' not in base_url.lower() else 'deepseek-chat'
+        if base_url and 'deepseek' in base_url.lower():
+            default_model = 'deepseek-chat'
+        elif base_url and 'openrouter' in base_url.lower():
+            # OpenRouter использует формат provider/model, по умолчанию OpenAI модель
+            default_model = 'openai/gpt-4o-mini'
+        else:
+            default_model = 'gpt-4o-mini'
+        
         self.model = os.getenv('OPENAI_MODEL', default_model)
+        logger.info(f"🤖 {name}: Используется модель {self.model}")
     
     def process(self, input_data: Dict) -> Dict:
         """Обрабатывает входные данные и возвращает результат"""
@@ -92,19 +133,37 @@ class IssueAnalyzerAgent(AGNOAgent):
 """
             
             logger.info(f"🤖 {self.name}: Анализирую issue...")
+            logger.debug(f"📝 {self.name}: Промпт для анализа: {prompt[:200]}...")
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.instructions},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3
-            )
+            # Проверка наличия API ключа
+            if not os.getenv('OPENAI_API_KEY'):
+                raise ValueError("OPENAI_API_KEY не установлен. Установите API ключ в .env файле.")
             
-            technical_spec = response.choices[0].message.content
-            
-            logger.info(f"✅ {self.name}: Техническое задание создано")
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.instructions},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3
+                )
+                
+                # Проверка ответа
+                if not response.choices or len(response.choices) == 0:
+                    raise ValueError("Модель не вернула ответ")
+                
+                if not response.choices[0].message or not response.choices[0].message.content:
+                    raise ValueError("Ответ модели пуст")
+                
+                technical_spec = response.choices[0].message.content
+                
+                logger.info(f"✅ {self.name}: Техническое задание создано (длина: {len(technical_spec)} символов)")
+                logger.debug(f"📋 {self.name}: ТЗ начало: {technical_spec[:200]}...")
+                
+            except Exception as api_error:
+                logger.error(f"❌ {self.name}: Ошибка API: {str(api_error)}")
+                raise
             
             return {
                 'success': True,
