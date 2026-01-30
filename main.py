@@ -461,53 +461,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
             
             logger.info(f"🌿 Создание/обновление ветки {branch_name}...")
             
-            # 4.1. Создаем PR на первой итерации (до изменений файлов)
-            if iteration == 1 and pr_number is None:
-                logger.info(f"🔀 Создание Pull Request на первой итерации...")
-                try:
-                    # Получаем SHA последнего коммита в основной ветке
-                    ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
-                    ref_response = requests.get(ref_url, headers=headers)
-                    if ref_response.status_code == 200:
-                        base_sha = ref_response.json()['object']['sha']
-                        
-                        # Создаем ветку, если её нет
-                        create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
-                        branch_data = {
-                            'ref': f'refs/heads/{branch_name}',
-                            'sha': base_sha
-                        }
-                        branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
-                        
-                        if branch_response.status_code == 201:
-                            logger.info(f"✅ Ветка {branch_name} создана")
-                        elif branch_response.status_code == 422:
-                            logger.info(f"ℹ️  Ветка {branch_name} уже существует")
-                        else:
-                            logger.warning(f"⚠️ Не удалось создать ветку для PR: {branch_response.status_code} - {branch_response.text}")
-                        
-                        # Создаем PR с пустым списком файлов (файлы будут добавлены позже)
-                        pr_result = create_pr_from_branch(
-                            owner=owner,
-                            repo=repo,
-                            branch_name=branch_name,
-                            default_branch=default_branch,
-                            issue_number=issue_number,
-                            technical_spec=current_spec,
-                            fixed_files=[],
-                            failed_files=[],
-                            installation_id=installation_id
-                        )
-                        
-                        if pr_result.get('success'):
-                            pr_number = pr_result.get('pr_number')
-                            logger.info(f"✅ PR создан: #{pr_number} - {pr_result.get('pr_url')}")
-                        else:
-                            logger.warning(f"⚠️ Не удалось создать PR: {pr_result.get('error')}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка при создании PR на первой итерации: {str(e)}")
-            
-            # 5. Получаем SHA последнего коммита в ветке (или основной ветке, если ветка не существует)
+            # 4. Получаем SHA последнего коммита в ветке (или основной ветке, если ветка не существует)
             ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
             ref_response = requests.get(ref_url, headers=headers)
             
@@ -625,7 +579,33 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                     'iteration': iteration
                 }
             
-            # 8. Запускаем CI после изменений
+            # 8. Создаем PR после первого коммита (только на первой итерации, если PR еще не создан)
+            if iteration == 1 and pr_number is None:
+                logger.info(f"🔀 Создание Pull Request после первого коммита...")
+                try:
+                    pr_result = create_pr_from_branch(
+                        owner=owner,
+                        repo=repo,
+                        branch_name=branch_name,
+                        default_branch=default_branch,
+                        issue_number=issue_number,
+                        technical_spec=current_spec,
+                        fixed_files=fixed_files,
+                        failed_files=failed_files,
+                        installation_id=installation_id
+                    )
+                    
+                    if pr_result.get('success'):
+                        pr_number = pr_result.get('pr_number')
+                        logger.info(f"✅ PR создан: #{pr_number} - {pr_result.get('pr_url')}")
+                    else:
+                        logger.warning(f"⚠️ Не удалось создать PR: {pr_result.get('error')}")
+                        # Продолжаем работу даже если PR не создан
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка при создании PR: {str(e)}")
+                    # Продолжаем работу даже если PR не создан
+            
+            # 9. Запускаем CI после изменений
             logger.info(f"🧪 Запуск CI после изменений на ветке {branch_name}...")
             ci_after = run_ci_commands(owner, repo, branch_name, ci_commands, installation_id)
             
@@ -633,7 +613,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                 logger.warning(f"⚠️ Не удалось запустить CI: {ci_after.get('error')}")
                 ci_after = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
             
-            # 9. Проверяем совпадение результатов CI программно
+            # 10. Проверяем совпадение результатов CI программно
             logger.info(f"🔍 Проверка совпадения результатов CI...")
             ci_match_result = check_ci_results_match(ci_before, ci_after)
             
@@ -649,7 +629,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                 }
             else:
                 logger.info(f"✅ Результаты CI совпадают или улучшились")
-                # 10. Проверяем через Reviewer
+                # 11. Проверяем через Reviewer
                 logger.info(f"👀 Проверка изменений через Reviewer...")
                 review_result = agno_system.review_changes(
                     issue_title=issue_title,
@@ -668,7 +648,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                         review_result['approved'] = False
                         review_result['reason'] = f"Автоматическое отклонение: {ci_match_result.get('reason')}"
             
-            # 11. Добавляем комментарий от Reviewer в PR
+            # 12. Добавляем комментарий от Reviewer в PR
             if pr_number:
                 logger.info(f"💬 Добавление комментария Reviewer в PR #{pr_number}...")
                 
@@ -961,8 +941,20 @@ Closes #{issue_number}
                 logger.error(f"❌ Ответ сервера: {pr_response.text[:500]}")
                 raise Exception(f"Не удалось распарсить ответ при создании PR: {str(json_error)}")
 
-        # PR уже существует
+        # Ошибка 422 может означать либо что PR уже существует, либо что ветка не существует
         elif pr_response.status_code == 422:
+            error_text = pr_response.text.lower()
+            
+            # Проверяем, существует ли ветка
+            branch_check_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+            branch_check_response = requests.get(branch_check_url, headers=headers)
+            
+            if branch_check_response.status_code != 200:
+                # Ветка не существует - это основная причина ошибки
+                logger.error(f"❌ Ветка {branch_name} не существует. Нельзя создать PR без ветки.")
+                raise Exception(f"Ветка {branch_name} не существует. Сначала создайте ветку и закоммитьте изменения, затем создайте PR.")
+            
+            # Ветка существует, значит проблема в том, что PR уже существует
             # Получаем существующий PR - сначала пробуем открытые
             existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
             existing_prs_response = requests.get(existing_prs_url, headers=headers)
@@ -1002,6 +994,7 @@ Closes #{issue_number}
             
             # Логируем детали для отладки
             logger.error(f"❌ Не удалось получить существующий PR для ветки {branch_name}")
+            logger.error(f"❌ Ответ GitHub API (422): {pr_response.text[:500]}")
             if existing_prs_response.status_code != 200:
                 logger.error(f"❌ Ошибка при запросе открытых PR: {existing_prs_response.status_code} - {existing_prs_response.text[:500]}")
             if existing_prs_response_all.status_code != 200:
