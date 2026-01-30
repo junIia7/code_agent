@@ -1845,6 +1845,241 @@ def fix_issue():
             'error': str(e)
         }), 500
 
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    Обработчик webhook от GitHub
+    """
+    try:
+        # Получаем сырое тело запроса для проверки подписи
+        payload_body = request.get_data()
+        
+        # Проверяем подпись webhook
+        signature_header = request.headers.get('X-Hub-Signature-256')
+        if not verify_webhook_signature(payload_body, signature_header):
+            logger.error("❌ Ошибка: Неверная подпись webhook")
+            return jsonify({
+                'error': 'Неверная подпись webhook'
+            }), 401
+        
+        # Парсим JSON payload
+        payload = request.json
+        event_type = request.headers.get('X-GitHub-Event')
+        
+        logger.info(f"📥 Получено событие: {event_type}")
+        
+        # Обработка установки GitHub App
+        if event_type == 'installation' and payload.get('action') == 'created':
+            installation_id = payload['installation']['id']
+            logger.info(f"✅ GitHub App установлен! Installation ID: {installation_id}")
+            return jsonify({
+                'message': f'GitHub App установлен! Installation ID: {installation_id}',
+                'installation_id': installation_id
+            })
+        
+        # Обработка создания issue
+        if event_type == 'issues' and payload.get('action') == 'opened':
+            issue = payload.get('issue', {})
+            repository = payload.get('repository', {})
+            
+            repo_name = repository.get('name', 'Неизвестный репозиторий')
+            repo_full_name = repository.get('full_name', 'Неизвестный репозиторий')
+            issue_title = issue.get('title', 'Без названия')
+            issue_body = issue.get('body', '')
+            issue_number = issue.get('number', '?')
+            
+            # Выводим в логи имя репозитория и название issue
+            logger.info("=" * 60)
+            logger.info(f"📝 СОЗДАНА НОВАЯ ISSUE")
+            logger.info(f"📦 Репозиторий: {repo_name}")
+            logger.info(f"🔗 Полное имя: {repo_full_name}")
+            logger.info(f"#️⃣  Номер issue: #{issue_number}")
+            logger.info(f"📌 Название issue: {issue_title}")
+            logger.info("=" * 60)
+            
+            # Анализируем issue и создаем ТЗ через AGNO агента
+            logger.info("\n🤖 Анализирую issue и создаю техническое задание...")
+            try:
+                analysis_result = agno_system.analyze_issue(
+                    issue_title=issue_title,
+                    issue_body=issue_body,
+                    repository_name=repo_full_name
+                )
+                
+                if analysis_result.get('success'):
+                    technical_spec = analysis_result.get('technical_spec', '')
+                    
+                    # Выводим ТЗ в логи
+                    logger.info("\n" + "=" * 80)
+                    logger.info("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
+                    logger.info("=" * 80)
+                    logger.info(technical_spec)
+                    logger.info("=" * 80 + "\n")
+                    
+                    # Извлекаем owner и repo из repo_full_name
+                    repo_parts = repo_full_name.split('/')
+                    if len(repo_parts) == 2:
+                        repo_owner = repo_parts[0]
+                        repo_repo = repo_parts[1]
+                    else:
+                        raise ValueError(f"Неверный формат repo_full_name: {repo_full_name}")
+                    
+                    # Получаем installation_id из payload
+                    installation_id = payload.get('installation', {}).get('id')
+                    if not installation_id:
+                        installation_id = find_installation_id_for_repo(repo_owner, repo_repo)
+                    if not installation_id:
+                        installation_id = GITHUB_INSTALLATION_ID or None
+                    
+                    # Запускаем CI анализ репозитория
+                    logger.info("🔍 Анализирую репозиторий и определяю CI команды...")
+                    ci_commands_result = determine_ci_commands(repo_owner, repo_repo, installation_id)
+                    
+                    if not ci_commands_result.get('success'):
+                        logger.warning(f"⚠️ Не удалось определить CI команды: {ci_commands_result.get('error')}")
+                        ci_commands = {}
+                        ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                    else:
+                        ci_commands = ci_commands_result.get('commands', {})
+                        logger.info(f"✅ Определены CI команды: {ci_commands}")
+                        
+                        # Запускаем CI на основной ветке (до изменений)
+                        logger.info("🧪 Запуск CI на основной ветке (до изменений)...")
+                        repo_url = f'https://api.github.com/repos/{repo_owner}/{repo_repo}'
+                        if installation_id:
+                            access_token = get_installation_access_token(installation_id)
+                            repo_headers = {
+                                'Authorization': f'token {access_token}',
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                        else:
+                            personal_token = os.getenv('GITHUB_TOKEN')
+                            repo_headers = {
+                                'Authorization': f'token {personal_token}',
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                        repo_response = requests.get(repo_url, headers=repo_headers)
+                        default_branch = 'main'
+                        if repo_response.status_code == 200:
+                            default_branch = repo_response.json().get('default_branch', 'main')
+                        
+                        ci_before = run_ci_commands(repo_owner, repo_repo, default_branch, ci_commands, installation_id)
+                        if not ci_before.get('success'):
+                            logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
+                            ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                        else:
+                            logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                    
+                    # Автоматически исправляем код, проверяем через Reviewer и создаем PR
+                    logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
+                    try:
+                        pr_result = auto_fix_and_create_pr_with_review(
+                            owner=repo_owner,
+                            repo=repo_repo,
+                            issue_number=issue_number,
+                            issue_title=issue_title,
+                            issue_body=issue_body,
+                            technical_spec=technical_spec,
+                            ci_commands=ci_commands,
+                            ci_before=ci_before,
+                            installation_id=installation_id,
+                            max_iterations=10
+                        )
+                        
+                        if pr_result.get('success'):
+                            logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')} (итераций: {pr_result.get('iteration', 1)})")
+                        else:
+                            logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')} (итераций: {pr_result.get('iteration', 0)})")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
+                        pr_result = None
+                else:
+                    logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
+                    technical_spec = None
+                    pr_result = None
+                    ci_before = None
+                    
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
+                technical_spec = None
+                pr_result = None
+                ci_before = None
+            
+            response_data = {
+                'success': True,
+                'event': 'issue_opened',
+                'repository': {
+                    'name': repo_name,
+                    'full_name': repo_full_name
+                },
+                'issue': {
+                    'number': issue_number,
+                    'title': issue_title,
+                    'url': issue.get('html_url', ''),
+                    'body': issue_body
+                },
+                'technical_spec': technical_spec if technical_spec else None,
+                'message': f'Issue #{issue_number} "{issue_title}" создана в репозитории {repo_full_name}'
+            }
+            
+            if pr_result and pr_result.get('success'):
+                response_data['pull_request'] = {
+                    'number': pr_result.get('pr_number'),
+                    'url': pr_result.get('pr_url'),
+                    'branch': pr_result.get('branch'),
+                    'fixed_files': pr_result.get('fixed_files', []),
+                    'iteration': pr_result.get('iteration', 1)
+                }
+                if pr_result.get('review'):
+                    response_data['review'] = {
+                        'approved': pr_result['review'].get('approved'),
+                        'reason': pr_result['review'].get('reason')
+                    }
+                response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")} (итераций: {pr_result.get("iteration", 1)})'
+            elif pr_result:
+                response_data['pr_error'] = pr_result.get('error')
+                response_data['pr_iteration'] = pr_result.get('iteration', 0)
+                if pr_result.get('review'):
+                    response_data['review'] = {
+                        'approved': pr_result['review'].get('approved'),
+                        'reason': pr_result['review'].get('reason'),
+                        'issues': pr_result['review'].get('issues', [])
+                    }
+            
+            if ci_before:
+                response_data['ci_before'] = {
+                    'build_passed': ci_before.get('summary', {}).get('build_passed'),
+                    'test_passed': ci_before.get('summary', {}).get('test_passed'),
+                    'quality_passed': ci_before.get('summary', {}).get('quality_passed')
+                }
+            
+            return jsonify(response_data)
+        
+        # Обработка других событий репозитория
+        if 'repository' in payload:
+            repo = payload['repository']
+            repo_name = repo.get('name')
+            repo_full_name = repo.get('full_name')
+            
+            logger.info(f"📦 Событие {event_type} для репозитория: {repo_full_name}")
+            
+            return jsonify({
+                'event': event_type,
+                'repository_name': repo_name,
+                'repository_full_name': repo_full_name,
+                'message': f'Получено событие {event_type} для репозитория {repo_full_name}'
+            })
+        
+        logger.info(f"ℹ️  Необработанное событие: {event_type}")
+        return jsonify({
+            'event': event_type,
+            'message': 'Webhook получен'
+        })
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки webhook: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
