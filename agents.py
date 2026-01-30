@@ -293,14 +293,27 @@ class ReviewerAgent(AGNOAgent):
 4. Сравнить результаты CI до и после изменений
 5. Дать вердикт: принимается решение или нет
 
-Критерии принятия:
-- ОБЯЗАТЕЛЬНО: Сборка проекта должна работать так же, как до изменений (или лучше)
-- ОБЯЗАТЕЛЬНО: Тесты должны проходить так же, как до изменений (или лучше)
+КРИТИЧЕСКИ ВАЖНЫЕ КРИТЕРИИ ПРИНЯТИЯ (ОБЯЗАТЕЛЬНЫЕ):
+- РЕЗУЛЬТАТЫ CI ДО И ПОСЛЕ ИЗМЕНЕНИЙ ДОЛЖНЫ СОВПАДАТЬ:
+  * Если сборка проходила ДО изменений - она ДОЛЖНА проходить и ПОСЛЕ
+  * Если сборка НЕ проходила ДО изменений - она МОЖЕТ не проходить и ПОСЛЕ (но лучше исправить)
+  * Если тесты проходили ДО изменений - они ДОЛЖНЫ проходить и ПОСЛЕ
+  * Если тесты НЕ проходили ДО изменений - они МОЖУТ не проходить и ПОСЛЕ (но лучше исправить)
+  
+- ЗАПРЕЩЕНО одобрять изменения, если:
+  * Сборка проходила ДО, но НЕ проходит ПОСЛЕ - ОТКЛОНИТЬ
+  * Тесты проходили ДО, но НЕ проходят ПОСЛЕ - ОТКЛОНИТЬ
+  * Любое ухудшение состояния CI - ОТКЛОНИТЬ
+
 - ОПЦИОНАЛЬНО: Качество кода не должно ухудшиться (но это не решающий фактор)
+
+ВАЖНО: Результаты CI до и после должны быть ИДЕНТИЧНЫМИ или ЛУЧШЕ. 
+Если состояние CI ухудшилось - ОБЯЗАТЕЛЬНО отклонить изменения.
 
 Если изменения не соответствуют критериям, ты должен:
 - Четко описать проблему
 - Указать, что именно не работает
+- Указать, как изменились результаты CI
 - Дать рекомендации по исправлению
 
 Формат ответа должен быть JSON:
@@ -328,6 +341,9 @@ class ReviewerAgent(AGNOAgent):
             ci_after = input_data.get('ci_after', {})
             repository_name = input_data.get('repository_name', '')
             
+            # Формируем детальное сравнение CI
+            ci_comparison = self._format_ci_comparison(ci_before, ci_after)
+            
             # Формируем запрос для проверки
             prompt = f"""
 РЕПОЗИТОРИЙ: {repository_name}
@@ -342,18 +358,15 @@ class ReviewerAgent(AGNOAgent):
 ИЗМЕНЕННЫЕ ФАЙЛЫ:
 {', '.join(changed_files) if changed_files else 'Не указаны'}
 
-РЕЗУЛЬТАТЫ CI ДО ИЗМЕНЕНИЙ:
-Сборка: {'✅ Успешно' if ci_before.get('summary', {}).get('build_passed') else '❌ Ошибка'}
-Тесты: {'✅ Успешно' if ci_before.get('summary', {}).get('test_passed') else '❌ Ошибка'}
-Качество: {'✅ Успешно' if ci_before.get('summary', {}).get('quality_passed') else '⚠️ Предупреждения' if ci_before.get('summary', {}).get('quality_passed') is False else 'Не проверялось'}
+{ci_comparison}
 
-РЕЗУЛЬТАТЫ CI ПОСЛЕ ИЗМЕНЕНИЙ:
-Сборка: {'✅ Успешно' if ci_after.get('summary', {}).get('build_passed') else '❌ Ошибка'}
-Тесты: {'✅ Успешно' if ci_after.get('summary', {}).get('test_passed') else '❌ Ошибка'}
-Качество: {'✅ Успешно' if ci_after.get('summary', {}).get('quality_passed') else '⚠️ Предупреждения' if ci_after.get('summary', {}).get('quality_passed') is False else 'Не проверялось'}
-
-ДЕТАЛИ ОШИБОК (если есть):
+ДЕТАЛИ ОШИБОК ПОСЛЕ ИЗМЕНЕНИЙ (если есть):
 {self._format_ci_details(ci_after)}
+
+КРИТИЧЕСКИ ВАЖНО: 
+Сравни результаты CI ДО и ПОСЛЕ изменений. 
+Результаты ДОЛЖНЫ совпадать или быть лучше. 
+Если сборка/тесты проходили ДО, но НЕ проходят ПОСЛЕ - ОБЯЗАТЕЛЬНО отклони изменения.
 
 Проверь изменения и дай вердикт. Отвечай ТОЛЬКО JSON объектом в указанном формате.
 """
@@ -409,6 +422,74 @@ class ReviewerAgent(AGNOAgent):
                 'approved': False,
                 'agent': self.name
             }
+    
+    def _format_ci_comparison(self, ci_before, ci_after):
+        """Форматирует сравнение результатов CI до и после изменений"""
+        before_summary = ci_before.get('summary', {}) if ci_before else {}
+        after_summary = ci_after.get('summary', {}) if ci_after else {}
+        
+        build_before = before_summary.get('build_passed')
+        test_before = before_summary.get('test_passed')
+        quality_before = before_summary.get('quality_passed')
+        
+        build_after = after_summary.get('build_passed')
+        test_after = after_summary.get('test_passed')
+        quality_after = after_summary.get('quality_passed')
+        
+        # Форматируем статусы
+        def format_status(status, label):
+            if status is True:
+                return f"{label}: ✅ Успешно"
+            elif status is False:
+                return f"{label}: ❌ Ошибка"
+            else:
+                return f"{label}: ⚪ Не проверялось"
+        
+        # Определяем изменения
+        build_change = ""
+        test_change = ""
+        
+        if build_before is not None and build_after is not None:
+            if build_before and not build_after:
+                build_change = " ⚠️ УХУДШЕНИЕ: сборка проходила ДО, но НЕ проходит ПОСЛЕ - ОТКЛОНИТЬ!"
+            elif not build_before and build_after:
+                build_change = " ✅ УЛУЧШЕНИЕ: сборка не проходила ДО, но проходит ПОСЛЕ"
+            elif build_before == build_after:
+                build_change = " ✅ Без изменений"
+            else:
+                build_change = " ⚠️ Изменение состояния"
+        
+        if test_before is not None and test_after is not None:
+            if test_before and not test_after:
+                test_change = " ⚠️ УХУДШЕНИЕ: тесты проходили ДО, но НЕ проходят ПОСЛЕ - ОТКЛОНИТЬ!"
+            elif not test_before and test_after:
+                test_change = " ✅ УЛУЧШЕНИЕ: тесты не проходили ДО, но проходят ПОСЛЕ"
+            elif test_before == test_after:
+                test_change = " ✅ Без изменений"
+            else:
+                test_change = " ⚠️ Изменение состояния"
+        
+        comparison = f"""
+═══════════════════════════════════════════════════════════════
+СРАВНЕНИЕ РЕЗУЛЬТАТОВ CI ДО И ПОСЛЕ ИЗМЕНЕНИЙ
+═══════════════════════════════════════════════════════════════
+
+РЕЗУЛЬТАТЫ CI ДО ИЗМЕНЕНИЙ:
+{format_status(build_before, 'Сборка')}
+{format_status(test_before, 'Тесты')}
+{format_status(quality_before, 'Качество')}
+
+РЕЗУЛЬТАТЫ CI ПОСЛЕ ИЗМЕНЕНИЙ:
+{format_status(build_after, 'Сборка')}{build_change}
+{format_status(test_after, 'Тесты')}{test_change}
+{format_status(quality_after, 'Качество')}
+
+═══════════════════════════════════════════════════════════════
+КРИТИЧЕСКОЕ ПРАВИЛО: Результаты CI ДО и ПОСЛЕ должны СОВПАДАТЬ или быть ЛУЧШЕ.
+Если сборка/тесты проходили ДО, но НЕ проходят ПОСЛЕ - ОБЯЗАТЕЛЬНО отклони!
+═══════════════════════════════════════════════════════════════
+"""
+        return comparison
     
     def _format_ci_details(self, ci_results):
         """Форматирует детали результатов CI для промпта"""

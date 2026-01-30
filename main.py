@@ -309,6 +309,63 @@ def get_issue_data(owner, repo, issue_number, installation_id=None):
     else:
         raise Exception(f"Ошибка получения issue: {response.status_code} - {response.text}")
 
+def check_ci_results_match(ci_before, ci_after):
+    """
+    Проверяет, что результаты CI до и после изменений совпадают или улучшились
+    
+    Args:
+        ci_before: Результаты CI до изменений
+        ci_after: Результаты CI после изменений
+        
+    Returns:
+        dict с результатом проверки
+    """
+    before_summary = ci_before.get('summary', {}) if ci_before else {}
+    after_summary = ci_after.get('summary', {}) if ci_after else {}
+    
+    build_before = before_summary.get('build_passed')
+    test_before = before_summary.get('test_passed')
+    
+    build_after = after_summary.get('build_passed')
+    test_after = after_summary.get('test_passed')
+    
+    issues = []
+    recommendations = []
+    
+    # Проверяем сборку
+    if build_before is not None and build_after is not None:
+        if build_before and not build_after:
+            issues.append("Сборка проходила ДО изменений, но НЕ проходит ПОСЛЕ изменений")
+            recommendations.append("Исправить ошибки сборки, чтобы восстановить работоспособность проекта")
+        elif not build_before and build_after:
+            # Это улучшение - сборка начала проходить
+            pass
+    
+    # Проверяем тесты
+    if test_before is not None and test_after is not None:
+        if test_before and not test_after:
+            issues.append("Тесты проходили ДО изменений, но НЕ проходят ПОСЛЕ изменений")
+            recommendations.append("Исправить падающие тесты, чтобы восстановить работоспособность")
+        elif not test_before and test_after:
+            # Это улучшение - тесты начали проходить
+            pass
+    
+    # Если есть проблемы - результаты не совпадают
+    if issues:
+        reason = "; ".join(issues)
+        return {
+            'match': False,
+            'reason': reason,
+            'issues': issues,
+            'recommendations': recommendations
+        }
+    
+    # Если все совпадает или улучшилось
+    return {
+        'match': True,
+        'reason': 'Результаты CI совпадают или улучшились'
+    }
+
 def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, issue_body, 
                                        technical_spec, ci_commands, ci_before, installation_id=None, max_iterations=10):
     """
@@ -531,17 +588,40 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                 logger.warning(f"⚠️ Не удалось запустить CI: {ci_after.get('error')}")
                 ci_after = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
             
-            # 9. Проверяем через Reviewer
-            logger.info(f"👀 Проверка изменений через Reviewer...")
-            review_result = agno_system.review_changes(
-                issue_title=issue_title,
-                issue_body=issue_body,
-                technical_spec=current_spec,
-                changed_files=fixed_files,
-                ci_before=ci_before,
-                ci_after=ci_after,
-                repository_name=repo_full_name
-            )
+            # 9. Проверяем совпадение результатов CI программно
+            logger.info(f"🔍 Проверка совпадения результатов CI...")
+            ci_match_result = check_ci_results_match(ci_before, ci_after)
+            
+            if not ci_match_result.get('match'):
+                logger.error(f"❌ Результаты CI не совпадают: {ci_match_result.get('reason')}")
+                # Автоматически отклоняем, даже не отправляя в Reviewer
+                review_result = {
+                    'success': True,
+                    'approved': False,
+                    'reason': f"Результаты CI не совпадают: {ci_match_result.get('reason')}",
+                    'issues': ci_match_result.get('issues', []),
+                    'recommendations': ci_match_result.get('recommendations', [])
+                }
+            else:
+                logger.info(f"✅ Результаты CI совпадают или улучшились")
+                # 10. Проверяем через Reviewer
+                logger.info(f"👀 Проверка изменений через Reviewer...")
+                review_result = agno_system.review_changes(
+                    issue_title=issue_title,
+                    issue_body=issue_body,
+                    technical_spec=current_spec,
+                    changed_files=fixed_files,
+                    ci_before=ci_before,
+                    ci_after=ci_after,
+                    repository_name=repo_full_name
+                )
+                
+                # Дополнительная проверка: даже если Reviewer одобрил, проверяем CI еще раз
+                if review_result.get('success') and review_result.get('approved'):
+                    if not ci_match_result.get('match'):
+                        logger.warning(f"⚠️ Reviewer одобрил, но результаты CI не совпадают. Отклоняю автоматически.")
+                        review_result['approved'] = False
+                        review_result['reason'] = f"Автоматическое отклонение: {ci_match_result.get('reason')}"
             
             if review_result.get('success') and review_result.get('approved'):
                 logger.info(f"✅ Reviewer одобрил изменения!")
