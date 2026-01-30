@@ -534,6 +534,7 @@ def index():
             'GET /': 'Эта страница - информация о возможностях агента',
             'POST /analyze': 'Анализ issue по ссылкам (repo_url и issue_url)',
             'POST /fix-code': 'Исправление кода на основе ТЗ (technical_spec, file_path, repo_url)',
+            'POST /test-analyzer': 'Тестирование работы агента-аналитика',
             'GET /repo/<owner>/<repo>': 'Получить информацию о репозитории',
             'GET /health': 'Проверка работоспособности'
         },
@@ -995,6 +996,83 @@ def fix_code():
             
     except Exception as e:
         logger.error(f"❌ Ошибка при исправлении кода: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/test-analyzer', methods=['POST', 'GET'])
+def test_analyzer():
+    """
+    Тестовый endpoint для проверки работы агента-аналитика
+    """
+    try:
+        # Тестовые данные
+        if request.method == 'POST':
+            data = request.get_json() or {}
+            test_title = data.get('title', 'Тестовая issue')
+            test_body = data.get('body', 'Это тестовое описание issue для проверки работы модели анализа.')
+            test_repo = data.get('repository', 'test/repo')
+        else:
+            test_title = 'Тестовая issue'
+            test_body = 'Это тестовое описание issue для проверки работы модели анализа.'
+            test_repo = 'test/repo'
+        
+        logger.info("🧪 Тестирование агента-аналитика...")
+        
+        # Проверяем настройки
+        api_key = os.getenv('OPENAI_API_KEY')
+        base_url = os.getenv('OPENAI_BASE_URL', '')
+        use_deepseek = os.getenv('USE_DEEPSEEK', '').lower() in ('true', '1', 'yes')
+        model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+        
+        config_info = {
+            'api_key_set': bool(api_key),
+            'api_key_length': len(api_key) if api_key else 0,
+            'base_url': base_url or 'default (OpenAI)',
+            'use_deepseek': use_deepseek,
+            'model': model
+        }
+        
+        if not api_key:
+            return jsonify({
+                'success': False,
+                'error': 'OPENAI_API_KEY не установлен',
+                'config': config_info
+            }), 400
+        
+        # Тестируем анализ
+        result = agno_system.analyze_issue(
+            issue_title=test_title,
+            issue_body=test_body,
+            repository_name=test_repo
+        )
+        
+        if result.get('success'):
+            technical_spec = result.get('technical_spec', '')
+            return jsonify({
+                'success': True,
+                'config': config_info,
+                'test_input': {
+                    'title': test_title,
+                    'body': test_body,
+                    'repository': test_repo
+                },
+                'result': {
+                    'technical_spec': technical_spec,
+                    'spec_length': len(technical_spec)
+                },
+                'message': 'Агент-аналитик работает корректно'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'config': config_info,
+                'error': result.get('error', 'Неизвестная ошибка')
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при тестировании: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
