@@ -934,7 +934,7 @@ Closes #{issue_number}
 
         # PR уже существует
         elif pr_response.status_code == 422:
-            # Получаем существующий PR
+            # Получаем существующий PR - сначала пробуем открытые
             existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
             existing_prs_response = requests.get(existing_prs_url, headers=headers)
             
@@ -944,7 +944,7 @@ Closes #{issue_number}
                     existing_pr_data = existing_prs[0]
                     pr_num = existing_pr_data.get('number')
                     html_url = existing_pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                    logger.info(f"ℹ️  PR уже существует: {html_url}")
+                    logger.info(f"ℹ️  PR уже существует (открыт): {html_url}")
                     return {
                         'success': True,
                         'pr_number': pr_num,
@@ -952,8 +952,34 @@ Closes #{issue_number}
                         'branch': branch_name
                     }
             
+            # Если не нашли среди открытых, пробуем все (включая закрытые/мердженные)
+            existing_prs_url_all = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=all'
+            existing_prs_response_all = requests.get(existing_prs_url_all, headers=headers)
+            
+            if existing_prs_response_all.status_code == 200:
+                existing_prs_all = existing_prs_response_all.json()
+                if existing_prs_all:
+                    existing_pr_data = existing_prs_all[0]
+                    pr_num = existing_pr_data.get('number')
+                    html_url = existing_pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
+                    state = existing_pr_data.get('state', 'unknown')
+                    logger.info(f"ℹ️  PR уже существует (статус: {state}): {html_url}")
+                    return {
+                        'success': True,
+                        'pr_number': pr_num,
+                        'pr_url': html_url,
+                        'branch': branch_name
+                    }
+            
+            # Логируем детали для отладки
+            logger.error(f"❌ Не удалось получить существующий PR для ветки {branch_name}")
+            if existing_prs_response.status_code != 200:
+                logger.error(f"❌ Ошибка при запросе открытых PR: {existing_prs_response.status_code} - {existing_prs_response.text[:500]}")
+            if existing_prs_response_all.status_code != 200:
+                logger.error(f"❌ Ошибка при запросе всех PR: {existing_prs_response_all.status_code} - {existing_prs_response_all.text[:500]}")
+            
             # Не удалось получить существующий PR
-            raise Exception("PR уже существует (статус 422), но не удалось его получить")
+            raise Exception(f"PR уже существует (статус 422), но не удалось его получить. Проверьте ветку {branch_name} в репозитории {owner}/{repo}")
 
         # Другие ошибки
         else:
