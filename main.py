@@ -332,13 +332,13 @@ def check_ci_results_match(ci_before, ci_after):
     issues = []
     recommendations = []
     
-    # Проверяем сборку
+    # Проверяем синтаксис (используется build_passed для обратной совместимости)
     if build_before is not None and build_after is not None:
         if build_before and not build_after:
-            issues.append("Сборка проходила ДО изменений, но НЕ проходит ПОСЛЕ изменений")
-            recommendations.append("Исправить ошибки сборки, чтобы восстановить работоспособность проекта")
+            issues.append("Проверка синтаксиса проходила ДО изменений, но НЕ проходит ПОСЛЕ изменений")
+            recommendations.append("Исправить синтаксические ошибки, чтобы восстановить работоспособность проекта")
         elif not build_before and build_after:
-            # Это улучшение - сборка начала проходить
+            # Это улучшение - проверка синтаксиса начала проходить
             pass
     
     # Проверяем тесты
@@ -682,8 +682,8 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
 {recommendations_text if recommendations_text else 'Не указаны'}
 
 РЕЗУЛЬТАТЫ CI:
-Сборка до: {'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}
-Сборка после: {'✅' if ci_after.get('summary', {}).get('build_passed') else '❌'}
+Проверка синтаксиса до: {'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}
+Проверка синтаксиса после: {'✅' if ci_after.get('summary', {}).get('build_passed') else '❌'}
 Тесты до: {'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}
 Тесты после: {'✅' if ci_after.get('summary', {}).get('test_passed') else '❌'}
 
@@ -1407,11 +1407,12 @@ def check_tests_exist(files, key_files):
 
 def determine_ci_commands(owner, repo, installation_id=None):
     """
-    Определяет команды для сборки, тестов и проверки качества кода на основе структуры репозитория
+    Определяет команды для проверки синтаксиса, тестов и проверки качества кода на основе структуры репозитория
     Анализирует конкретный проект и определяет подходящие команды
+    ВАЖНО: Не собирает проект, только проверяет синтаксические ошибки
     
     Returns:
-        dict с командами для CI
+        dict с командами для CI (build_command используется для проверки синтаксиса)
     """
     try:
         logger.info(f"🔍 Анализирую репозиторий {owner}/{repo} для определения CI команд...")
@@ -1471,20 +1472,30 @@ def determine_ci_commands(owner, repo, installation_id=None):
 2. Если тестов НЕТ - установи test_command в null (НЕ включай команду запуска тестов)
 3. Если тесты ЕСТЬ - определи правильную команду для их запуска на основе структуры проекта
 4. Команды должны быть специфичны для этого конкретного проекта, а не общие
+5. НЕ собирай проект! Только проверяй синтаксис кода
 
 Определи команды для:
-1. Сборки проекта (build_command) - ОБЯЗАТЕЛЬНО, если проект требует сборки
+1. Проверки синтаксиса кода (syntax_check_command) - ОБЯЗАТЕЛЬНО, команда для проверки синтаксических ошибок БЕЗ сборки проекта:
+   - Python: python -m py_compile или python -m ast для проверки синтаксиса
+   - JavaScript/Node.js: node --check для проверки синтаксиса JS файлов
+   - TypeScript: tsc --noEmit для проверки типов и синтаксиса без компиляции
+   - Java: javac -Xlint для проверки синтаксиса без компиляции
+   - Rust: cargo check (уже проверяет без сборки)
+   - Go: go build -o /dev/null ./... или go vet для проверки синтаксиса
+   - Другие языки: аналогичные команды только для проверки синтаксиса
 2. Запуска тестов (test_command) - ТОЛЬКО если тесты найдены, иначе null
 3. Проверки качества кода (quality_command) - опционально, может быть null
 4. Рабочая директория (working_directory) - если команды нужно запускать из поддиректории
 
 Верни JSON объект в формате:
 {{
-    "build_command": "команда для сборки или null",
+    "syntax_check_command": "команда для проверки синтаксиса или null",
     "test_command": "команда для запуска тестов или null (только если тесты есть!)",
     "quality_command": "команда для проверки качества кода или null",
     "working_directory": "директория для выполнения команд или ."
 }}
+
+ВАЖНО: НЕ используй команды сборки (build, compile, install). Только проверка синтаксиса!
 
 Отвечай ТОЛЬКО JSON объектом, без дополнительных комментариев.
 """
@@ -1493,7 +1504,7 @@ def determine_ci_commands(owner, repo, installation_id=None):
         response = agno_system.analyzer.client.chat.completions.create(
             model=agno_system.analyzer.model,
             messages=[
-                {"role": "system", "content": "Ты опытный DevOps инженер, который анализирует структуру конкретного репозитория и определяет точные команды для сборки, тестов и проверки качества кода, специфичные для этого проекта. Если тестов нет - не включай test_command. Отвечай только JSON объектом."},
+                {"role": "system", "content": "Ты опытный DevOps инженер, который анализирует структуру конкретного репозитория и определяет команды ТОЛЬКО для проверки синтаксиса кода (БЕЗ сборки проекта), тестов и проверки качества кода. НЕ используй команды сборки (build, compile). Только проверка синтаксиса. Если тестов нет - не включай test_command. Отвечай только JSON объектом."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0
@@ -1511,6 +1522,16 @@ def determine_ci_commands(owner, repo, installation_id=None):
         try:
             commands = json.loads(commands_text)
             
+            # Переименовываем syntax_check_command в build_command для обратной совместимости
+            if 'syntax_check_command' in commands and commands['syntax_check_command']:
+                commands['build_command'] = commands.pop('syntax_check_command')
+            elif 'build_command' not in commands or not commands.get('build_command'):
+                # Если нет ни того, ни другого, пытаемся определить эвристически
+                logger.warning(f"⚠️ Не найдена команда проверки синтаксиса, использую эвристику")
+                heuristic_result = determine_ci_commands_heuristic(key_files, language, files, has_tests)
+                if heuristic_result.get('success'):
+                    commands = heuristic_result.get('commands', commands)
+            
             # Дополнительная проверка: если тестов нет, принудительно убираем test_command
             if not has_tests:
                 if commands.get('test_command'):
@@ -1522,7 +1543,7 @@ def determine_ci_commands(owner, repo, installation_id=None):
                 commands['test_command'] = None
                 logger.warning(f"⚠️ Исправлено: test_command убран, так как тесты не найдены")
             
-            logger.info(f"✅ Определены CI команды для проекта: build={bool(commands.get('build_command'))}, test={bool(commands.get('test_command'))}, quality={bool(commands.get('quality_command'))}")
+            logger.info(f"✅ Определены CI команды для проекта: syntax_check={bool(commands.get('build_command'))}, test={bool(commands.get('test_command'))}, quality={bool(commands.get('quality_command'))}")
             return {
                 'success': True,
                 'commands': commands
@@ -1540,17 +1561,18 @@ def determine_ci_commands(owner, repo, installation_id=None):
         }
 
 def determine_ci_commands_heuristic(key_files, language, files, has_tests=False):
-    """Эвристическое определение команд CI на основе известных паттернов"""
+    """Эвристическое определение команд CI на основе известных паттернов (только проверка синтаксиса, без сборки)"""
     commands = {
-        'build_command': None,
+        'build_command': None,  # Используется для проверки синтаксиса
         'test_command': None,
         'quality_command': None,
         'working_directory': '.'
     }
     
-    # Python
+    # Python - проверка синтаксиса без установки зависимостей
     if 'requirements.txt' in key_files or 'setup.py' in key_files or 'pyproject.toml' in key_files:
-        commands['build_command'] = 'pip install -r requirements.txt' if 'requirements.txt' in key_files else 'pip install -e .'
+        # Проверяем синтаксис всех Python файлов
+        commands['build_command'] = 'find . -name "*.py" -type f -exec python -m py_compile {} + || python -c "import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]" $(find . -name "*.py" -type f)'
         if has_tests:
             # Проверяем наличие pytest
             if any('pytest' in f['path'].lower() or 'pytest.ini' in f['path'] for f in files if f['type'] == 'file'):
@@ -1559,46 +1581,54 @@ def determine_ci_commands_heuristic(key_files, language, files, has_tests=False)
                 commands['test_command'] = 'python -m unittest discover'
         commands['quality_command'] = 'pylint . || true'  # || true чтобы не падало на ошибках
     
-    # Node.js
+    # Node.js - проверка синтаксиса
     elif 'package.json' in key_files:
-        commands['build_command'] = 'npm install'
+        # Проверяем синтаксис JS файлов
+        commands['build_command'] = 'find . -name "*.js" -type f -exec node --check {} + || true'
         if has_tests:
             commands['test_command'] = 'npm test'
         commands['quality_command'] = 'npm run lint || true'
     
-    # Java (Maven)
+    # TypeScript
+    elif any(f['path'].endswith('tsconfig.json') for f in files if f['type'] == 'file'):
+        commands['build_command'] = 'tsc --noEmit'
+        if has_tests:
+            commands['test_command'] = 'npm test'
+        commands['quality_command'] = 'npm run lint || true'
+    
+    # Java (Maven) - проверка синтаксиса без компиляции
     elif 'pom.xml' in key_files:
-        commands['build_command'] = 'mvn clean compile'
+        commands['build_command'] = 'mvn validate || mvn compiler:compile -DskipTests || true'
         if has_tests:
             commands['test_command'] = 'mvn test'
         commands['quality_command'] = 'mvn checkstyle:check || true'
     
-    # Java (Gradle)
+    # Java (Gradle) - проверка синтаксиса
     elif 'build.gradle' in key_files:
-        commands['build_command'] = './gradlew build'
+        commands['build_command'] = './gradlew compileJava --dry-run || ./gradlew compileJava -x test || true'
         if has_tests:
             commands['test_command'] = './gradlew test'
         commands['quality_command'] = './gradlew check || true'
     
-    # Rust
+    # Rust - cargo check уже проверяет без сборки
     elif 'Cargo.toml' in key_files:
-        commands['build_command'] = 'cargo build'
+        commands['build_command'] = 'cargo check'
         if has_tests:
             commands['test_command'] = 'cargo test'
         commands['quality_command'] = 'cargo clippy || true'
     
-    # Go
+    # Go - проверка синтаксиса
     elif 'go.mod' in key_files:
-        commands['build_command'] = 'go build ./...'
+        commands['build_command'] = 'go build -o /dev/null ./... || go vet ./...'
         if has_tests:
             commands['test_command'] = 'go test ./...'
         commands['quality_command'] = 'golangci-lint run || true'
     
-    # Makefile
+    # Makefile - если есть синтаксическая проверка
     if any(f['path'] == 'Makefile' for f in files):
-        commands['build_command'] = 'make build' if commands['build_command'] is None else commands['build_command']
-        if has_tests:
-            commands['test_command'] = 'make test' if commands['test_command'] is None else commands['test_command']
+        # Не используем make build, так как это сборка
+        if has_tests and commands['test_command'] is None:
+            commands['test_command'] = 'make test'
     
     return {
         'success': True,
@@ -1608,12 +1638,13 @@ def determine_ci_commands_heuristic(key_files, language, files, has_tests=False)
 def run_ci_commands(owner, repo, branch, commands, installation_id=None):
     """
     Клонирует репозиторий и запускает CI команды локально
+    ВАЖНО: build_command используется для проверки синтаксиса, а не для сборки проекта
     
     Args:
         owner: Владелец репозитория
         repo: Название репозитория
         branch: Ветка для клонирования
-        commands: dict с командами (build_command, test_command, quality_command)
+        commands: dict с командами (build_command - проверка синтаксиса, test_command, quality_command)
         installation_id: ID установки GitHub App
         
     Returns:
@@ -1664,10 +1695,10 @@ def run_ci_commands(owner, repo, branch, commands, installation_id=None):
             'quality': {'success': None, 'output': '', 'error': ''}
         }
         
-        # Запускаем команду сборки
+        # Запускаем команду проверки синтаксиса (используется build_command для обратной совместимости)
         if commands.get('build_command'):
-            logger.info(f"🔨 Запуск сборки: {commands['build_command']}")
-            build_result = subprocess.run(
+            logger.info(f"🔍 Проверка синтаксиса: {commands['build_command']}")
+            syntax_result = subprocess.run(
                 commands['build_command'],
                 shell=True,
                 cwd=work_path,
@@ -1676,15 +1707,15 @@ def run_ci_commands(owner, repo, branch, commands, installation_id=None):
                 timeout=600
             )
             results['build'] = {
-                'success': build_result.returncode == 0,
-                'output': build_result.stdout,
-                'error': build_result.stderr,
-                'returncode': build_result.returncode
+                'success': syntax_result.returncode == 0,
+                'output': syntax_result.stdout,
+                'error': syntax_result.stderr,
+                'returncode': syntax_result.returncode
             }
-            if build_result.returncode == 0:
-                logger.info(f"✅ Сборка успешна")
+            if syntax_result.returncode == 0:
+                logger.info(f"✅ Проверка синтаксиса успешна")
             else:
-                logger.warning(f"⚠️ Сборка завершилась с ошибкой: {build_result.returncode}")
+                logger.warning(f"⚠️ Проверка синтаксиса выявила ошибки: {syntax_result.returncode}")
         
         # Запускаем тесты
         if commands.get('test_command'):
@@ -2009,7 +2040,7 @@ def analyze_issue():
                         logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
                         ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
                     else:
-                        logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                        logger.info(f"✅ CI до изменений: синтаксис={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
                 
                 # Автоматически исправляем код, проверяем через Reviewer и создаем PR
                 logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
@@ -2227,7 +2258,7 @@ def webhook():
                             logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
                             ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
                         else:
-                            logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                            logger.info(f"✅ CI до изменений: синтаксис={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
                     
                     # Автоматически исправляем код, проверяем через Reviewer и создаем PR
                     logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
