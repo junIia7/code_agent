@@ -15,8 +15,28 @@ class AGNOAgent:
         self.name = name
         self.role = role
         self.instructions = instructions
-        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        self.model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
+        
+        # Поддержка DeepSeek и других OpenAI-совместимых API
+        api_key = os.getenv('OPENAI_API_KEY')
+        base_url = os.getenv('OPENAI_BASE_URL')
+        
+        # Если base_url не указан, но ключ похож на DeepSeek, используем DeepSeek endpoint
+        if not base_url and api_key:
+            # DeepSeek ключи обычно начинаются с 'sk-' и имеют определенную длину
+            # Но лучше проверить через переменную окружения
+            if os.getenv('USE_DEEPSEEK', '').lower() in ('true', '1', 'yes'):
+                base_url = 'https://api.deepseek.com'
+        
+        # Создаем клиент с поддержкой кастомного base_url
+        client_kwargs = {'api_key': api_key}
+        if base_url:
+            client_kwargs['base_url'] = base_url
+        
+        self.client = OpenAI(**client_kwargs)
+        
+        # Модель по умолчанию зависит от провайдера
+        default_model = 'gpt-4o-mini' if not base_url or 'deepseek' not in base_url.lower() else 'deepseek-chat'
+        self.model = os.getenv('OPENAI_MODEL', default_model)
     
     def process(self, input_data: Dict) -> Dict:
         """Обрабатывает входные данные и возвращает результат"""
@@ -117,7 +137,7 @@ class CodeDeveloperAgent(AGNOAgent):
 - Писать чистый, читаемый код
 - Следовать лучшим практикам программирования
 - Сохранять существующую структуру кода, если это возможно
-- Добавлять комментарии, где это необходимо
+- Добавлять комментарии
 - Убедиться, что изменения решают проблему из ТЗ
 
 Формат ответа:
