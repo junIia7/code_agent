@@ -40,18 +40,50 @@ agno_system = AGNOAgentSystem()
 # Конфигурация GitHub App
 GITHUB_APP_ID = os.getenv('GITHUB_APP_ID')
 GITHUB_APP_PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
+GITHUB_APP_PRIVATE_KEY_PATH = os.getenv('GITHUB_APP_PRIVATE_KEY_PATH')
 GITHUB_INSTALLATION_ID = os.getenv('GITHUB_INSTALLATION_ID', '')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+
+def get_github_app_private_key():
+    """
+    Получает приватный ключ GitHub App из переменной окружения или файла
+    
+    Returns:
+        str: Приватный ключ
+    """
+    # Сначала проверяем путь к файлу
+    if GITHUB_APP_PRIVATE_KEY_PATH:
+        try:
+            if os.path.exists(GITHUB_APP_PRIVATE_KEY_PATH):
+                with open(GITHUB_APP_PRIVATE_KEY_PATH, 'r', encoding='utf-8') as f:
+                    private_key = f.read()
+                logger.info(f"✅ Приватный ключ загружен из файла: {GITHUB_APP_PRIVATE_KEY_PATH}")
+                return private_key
+            else:
+                logger.warning(f"⚠️  Файл с приватным ключом не найден: {GITHUB_APP_PRIVATE_KEY_PATH}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при чтении файла с приватным ключом: {str(e)}")
+    
+    # Если путь к файлу не указан или файл не найден, используем переменную окружения
+    if GITHUB_APP_PRIVATE_KEY:
+        return GITHUB_APP_PRIVATE_KEY
+    
+    return None
 
 def get_github_app_token():
     """
     Генерирует JWT токен для GitHub App
     """
-    if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
-        raise ValueError("GITHUB_APP_ID и GITHUB_APP_PRIVATE_KEY должны быть установлены")
+    if not GITHUB_APP_ID:
+        raise ValueError("GITHUB_APP_ID должен быть установлен")
     
-    # Парсим приватный ключ
-    private_key = GITHUB_APP_PRIVATE_KEY.replace('\\n', '\n')
+    # Получаем приватный ключ из переменной окружения или файла
+    private_key = get_github_app_private_key()
+    if not private_key:
+        raise ValueError("GITHUB_APP_PRIVATE_KEY или GITHUB_APP_PRIVATE_KEY_PATH должны быть установлены")
+    
+    # Парсим приватный ключ (заменяем \n на переносы строк)
+    private_key = private_key.replace('\\n', '\n')
     
     # Создаем JWT токен
     now = int(time.time())
@@ -95,8 +127,14 @@ def find_installation_id_for_repo(owner, repo):
         installation_id или None, если не найдено
     """
     try:
-        if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
-            logger.warning("⚠️  GitHub App не настроен, пропускаю поиск installation_id")
+        if not GITHUB_APP_ID:
+            logger.warning("⚠️  GITHUB_APP_ID не установлен, пропускаю поиск installation_id")
+            return None
+        
+        # Проверяем наличие приватного ключа (из переменной или файла)
+        private_key = get_github_app_private_key()
+        if not private_key:
+            logger.warning("⚠️  Приватный ключ GitHub App не найден (GITHUB_APP_PRIVATE_KEY или GITHUB_APP_PRIVATE_KEY_PATH), пропускаю поиск installation_id")
             return None
         
         app_token = get_github_app_token()
