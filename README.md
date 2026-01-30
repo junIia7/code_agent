@@ -9,7 +9,7 @@
 Отправьте POST запрос на `/fix-issue` с ссылкой на issue:
 
 ```bash
-curl -X POST http://your-server:5000/fix-issue \
+curl -X POST http://158.160.72.211:5000/fix-issue \
   -H "Content-Type: application/json" \
   -d '{
     "issue_url": "https://github.com/owner/repo/issues/1"
@@ -19,7 +19,7 @@ curl -X POST http://your-server:5000/fix-issue \
 Или с указанием owner и repo:
 
 ```bash
-curl -X POST http://your-server:5000/fix-issue \
+curl -X POST http://158.160.72.211:5000/fix-issue \
   -H "Content-Type: application/json" \
   -d '{
     "owner": "owner",
@@ -33,6 +33,11 @@ curl -X POST http://your-server:5000/fix-issue \
 1. Установите GitHub App в ваш репозиторий
 2. Настройте webhook URL в настройках GitHub App: `https://your-server/webhook`
 3. Создайте issue в репозитории - система автоматически обработает его через webhook
+
+Данные github app:
+1. App ID: 2760503
+2. Клиентский ID: Iv23ctCYCEorpUiWbMd7
+3. Ссылка для установки: https://github.com/settings/apps/fixissuesbot
 
 ### Что происходит при обработке
 
