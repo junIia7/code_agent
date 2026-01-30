@@ -61,6 +61,69 @@ def get_installation_access_token(installation_id):
     else:
         raise Exception(f"Ошибка получения access token: {response.status_code} - {response.text}")
 
+def find_installation_id_for_repo(owner, repo):
+    """
+    Автоматически находит installation_id для указанного репозитория
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        
+    Returns:
+        installation_id или None, если не найдено
+    """
+    try:
+        if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
+            print("⚠️  GitHub App не настроен, пропускаю поиск installation_id")
+            return None
+        
+        app_token = get_github_app_token()
+        headers = {
+            'Authorization': f'Bearer {app_token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+        
+        # Получаем список всех установок
+        url = 'https://api.github.com/app/installations'
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            print(f"⚠️  Не удалось получить список установок: {response.status_code}")
+            return None
+        
+        installations = response.json()
+        
+        # Проверяем каждую установку
+        for installation in installations:
+            installation_id = installation['id']
+            
+            try:
+                # Получаем access token для этой установки
+                access_token = get_installation_access_token(installation_id)
+                
+                # Проверяем доступ к репозиторию
+                repo_headers = {
+                    'Authorization': f'token {access_token}',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+                repo_url = f'https://api.github.com/repos/{owner}/{repo}'
+                repo_response = requests.get(repo_url, headers=repo_headers)
+                
+                if repo_response.status_code == 200:
+                    print(f"✅ Найдена установка #{installation_id} для репозитория {owner}/{repo}")
+                    return installation_id
+                    
+            except Exception as e:
+                # Пропускаем эту установку, если нет доступа
+                continue
+        
+        print(f"⚠️  Не найдена установка для репозитория {owner}/{repo}")
+        return None
+        
+    except Exception as e:
+        print(f"⚠️  Ошибка при поиске installation_id: {str(e)}")
+        return None
+
 def verify_webhook_signature(payload_body, signature_header):
     """
     Проверяет подпись webhook от GitHub используя HMAC SHA256
@@ -242,7 +305,18 @@ def get_repo_info(owner, repo):
     Получает информацию о репозитории
     """
     try:
-        installation_id = request.args.get('installation_id', GITHUB_INSTALLATION_ID) or None
+        # Проверяем, передан ли installation_id явно
+        installation_id = request.args.get('installation_id')
+        
+        # Если не передан, пытаемся найти автоматически
+        if not installation_id:
+            print(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
+            installation_id = find_installation_id_for_repo(owner, repo)
+        
+        # Если не нашли автоматически, используем значение из .env (если есть)
+        if not installation_id:
+            installation_id = GITHUB_INSTALLATION_ID or None
+        
         repo_info = get_repository_name(owner, repo, installation_id)
         return jsonify({
             'success': True,
@@ -309,9 +383,22 @@ def analyze_issue():
                 'error': f'Ошибка парсинга URL: {str(e)}'
             }), 400
         
-        # Получаем данные issue через GitHub API
-        installation_id = request.args.get('installation_id') or request.json.get('installation_id') if request.is_json else GITHUB_INSTALLATION_ID
-        installation_id = installation_id or None
+        # Автоматически определяем installation_id для репозитория
+        # Сначала проверяем, не передан ли он явно (для обратной совместимости)
+        installation_id = None
+        if request.method == 'GET':
+            installation_id = request.args.get('installation_id')
+        elif request.is_json:
+            installation_id = request.json.get('installation_id')
+        
+        # Если не передан явно, пытаемся найти автоматически
+        if not installation_id:
+            print(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
+            installation_id = find_installation_id_for_repo(owner, repo)
+        
+        # Если не нашли автоматически, используем значение из .env (если есть)
+        if not installation_id:
+            installation_id = GITHUB_INSTALLATION_ID or None
         
         print(f"🔍 Получение данных issue #{issue_number} из {owner}/{repo}...")
         issue_data = get_issue_data(owner, repo, issue_number, installation_id)
