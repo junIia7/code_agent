@@ -3,6 +3,7 @@ import jwt
 import time
 import hmac
 import hashlib
+import re
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
@@ -88,6 +89,82 @@ def verify_webhook_signature(payload_body, signature_header):
     # Безопасное сравнение хешей
     return hmac.compare_digest(received_hash, expected_hash)
 
+def parse_github_url(url):
+    """
+    Парсит GitHub URL и извлекает owner, repo и issue number
+    
+    Args:
+        url: GitHub URL (репозиторий или issue)
+        
+    Returns:
+        dict с owner, repo, issue_number (если есть)
+    """
+    # Паттерны для разных форматов GitHub URL
+    patterns = [
+        r'github\.com/([^/]+)/([^/]+)/issues/(\d+)',  # issue URL
+        r'github\.com/([^/]+)/([^/]+)',  # repo URL
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            owner = match.group(1)
+            repo = match.group(2)
+            issue_number = match.group(3) if len(match.groups()) > 2 else None
+            return {
+                'owner': owner,
+                'repo': repo,
+                'issue_number': issue_number
+            }
+    
+    raise ValueError(f"Неверный формат GitHub URL: {url}")
+
+def get_issue_data(owner, repo, issue_number, installation_id=None):
+    """
+    Получает данные issue через GitHub API
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        issue_number: Номер issue
+        installation_id: ID установки GitHub App (опционально)
+        
+    Returns:
+        dict с данными issue
+    """
+    if installation_id:
+        access_token = get_installation_access_token(installation_id)
+        headers = {
+            'Authorization': f'token {access_token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    else:
+        # Альтернативный способ: использование личного токена
+        personal_token = os.getenv('GITHUB_TOKEN')
+        if not personal_token:
+            raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+        headers = {
+            'Authorization': f'token {personal_token}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    
+    url = f'https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}'
+    response = requests.get(url, headers=headers)
+    
+    if response.status_code == 200:
+        issue_data = response.json()
+        return {
+            'number': issue_data['number'],
+            'title': issue_data['title'],
+            'body': issue_data.get('body', ''),
+            'state': issue_data['state'],
+            'url': issue_data['html_url'],
+            'created_at': issue_data['created_at'],
+            'user': issue_data['user']['login']
+        }
+    else:
+        raise Exception(f"Ошибка получения issue: {response.status_code} - {response.text}")
+
 def get_repository_name(owner, repo, installation_id=None):
     """
     Получает название репозитория через GitHub API
@@ -128,13 +205,34 @@ def get_repository_name(owner, repo, installation_id=None):
 @app.route('/')
 def index():
     """
-    Главная страница
+    Главная страница с информацией о возможностях агента
     """
     return jsonify({
-        'message': 'GitHub App для получения информации о репозитории',
+        'name': 'GitHub Issue Analyzer Agent',
+        'description': 'AI агент для анализа GitHub issues и создания технических заданий',
+        'version': '1.0.0',
+        'capabilities': [
+            'Анализ GitHub issues через webhook',
+            'Прямой анализ issue по ссылке',
+            'Автоматическое создание технических заданий',
+            'Интеграция с LangGraph для AI анализа'
+        ],
         'endpoints': {
-            '/repo/<owner>/<repo>': 'Получить информацию о репозитории',
-            '/webhook': 'Webhook для GitHub событий'
+            'GET /': 'Эта страница - информация о возможностях агента',
+            'POST /analyze': 'Анализ issue по ссылкам (repo_url и issue_url)',
+            'GET /repo/<owner>/<repo>': 'Получить информацию о репозитории',
+            'GET /health': 'Проверка работоспособности'
+        },
+        'usage': {
+            'analyze_issue': {
+                'method': 'POST',
+                'url': '/analyze',
+                'body': {
+                    'repo_url': 'https://github.com/owner/repo',
+                    'issue_url': 'https://github.com/owner/repo/issues/1'
+                },
+                'example': 'curl -X POST http://your-server/analyze -H "Content-Type: application/json" -d \'{"repo_url": "https://github.com/owner/repo", "issue_url": "https://github.com/owner/repo/issues/1"}\''
+            }
         }
     })
 
@@ -151,6 +249,128 @@ def get_repo_info(owner, repo):
             'repository': repo_info
         })
     except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/analyze', methods=['POST', 'GET'])
+def analyze_issue():
+    """
+    Анализирует issue по ссылкам на репозиторий и issue
+    Поддерживает как POST (JSON), так и GET (query parameters)
+    """
+    try:
+        # Поддержка GET запросов с query parameters
+        if request.method == 'GET':
+            repo_url = request.args.get('repo_url')
+            issue_url = request.args.get('issue_url')
+            
+            # Если передан только issue_url, извлекаем repo из него
+            if issue_url and not repo_url:
+                parsed = parse_github_url(issue_url)
+                repo_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}"
+        else:
+            # POST запрос с JSON
+            data = request.get_json() or {}
+            repo_url = data.get('repo_url')
+            issue_url = data.get('issue_url')
+            
+            # Если передан только issue_url, извлекаем repo из него
+            if issue_url and not repo_url:
+                parsed = parse_github_url(issue_url)
+                repo_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}"
+        
+        # Проверяем обязательные параметры
+        if not issue_url:
+            return jsonify({
+                'success': False,
+                'error': 'Необходимо указать issue_url (ссылка на issue)'
+            }), 400
+        
+        # Парсим ссылки
+        try:
+            issue_parsed = parse_github_url(issue_url)
+            repo_parsed = parse_github_url(repo_url) if repo_url else issue_parsed
+            
+            owner = issue_parsed['owner']
+            repo = issue_parsed['repo']
+            issue_number = issue_parsed['issue_number']
+            
+            if not issue_number:
+                return jsonify({
+                    'success': False,
+                    'error': 'В ссылке issue_url должен быть указан номер issue'
+                }), 400
+                
+        except ValueError as e:
+            return jsonify({
+                'success': False,
+                'error': f'Ошибка парсинга URL: {str(e)}'
+            }), 400
+        
+        # Получаем данные issue через GitHub API
+        installation_id = request.args.get('installation_id') or request.json.get('installation_id') if request.is_json else GITHUB_INSTALLATION_ID
+        installation_id = installation_id or None
+        
+        print(f"🔍 Получение данных issue #{issue_number} из {owner}/{repo}...")
+        issue_data = get_issue_data(owner, repo, issue_number, installation_id)
+        
+        repo_full_name = f"{owner}/{repo}"
+        issue_title = issue_data['title']
+        issue_body = issue_data['body'] or ''
+        
+        # Выводим информацию в консоль
+        print("=" * 80)
+        print(f"📝 АНАЛИЗ ISSUE (прямой запрос)")
+        print(f"📦 Репозиторий: {repo}")
+        print(f"🔗 Полное имя: {repo_full_name}")
+        print(f"#️⃣  Номер issue: #{issue_number}")
+        print(f"📌 Название issue: {issue_title}")
+        print("=" * 80)
+        
+        # Анализируем issue и создаем ТЗ
+        print("\n🤖 Анализирую issue и создаю техническое задание...")
+        try:
+            technical_spec = analyze_issue_to_spec(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                repository_name=repo_full_name
+            )
+            
+            # Выводим ТЗ в консоль
+            print("\n" + "=" * 80)
+            print("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
+            print("=" * 80)
+            print(technical_spec)
+            print("=" * 80 + "\n")
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
+            technical_spec = None
+        
+        return jsonify({
+            'success': True,
+            'repository': {
+                'name': repo,
+                'full_name': repo_full_name,
+                'url': f'https://github.com/{repo_full_name}'
+            },
+            'issue': {
+                'number': issue_number,
+                'title': issue_title,
+                'body': issue_body,
+                'url': issue_data['url'],
+                'state': issue_data['state'],
+                'created_at': issue_data['created_at'],
+                'author': issue_data['user']
+            },
+            'technical_spec': technical_spec,
+            'message': f'Issue #{issue_number} "{issue_title}" успешно проанализирована'
+        })
+        
+    except Exception as e:
+        print(f"❌ Ошибка при анализе issue: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)

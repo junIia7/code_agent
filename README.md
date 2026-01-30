@@ -96,6 +96,48 @@ python main.py
 
 ## Использование
 
+### Прямой анализ issue по ссылкам
+
+Вы можете обратиться к серверу напрямую по IP/домену и отправить ссылки на репозиторий и issue:
+
+**Через POST запрос:**
+```bash
+curl -X POST http://your-server-ip:5000/analyze \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repo_url": "https://github.com/owner/repo",
+    "issue_url": "https://github.com/owner/repo/issues/1"
+  }'
+```
+
+**Через GET запрос:**
+```bash
+curl "http://your-server-ip:5000/analyze?issue_url=https://github.com/owner/repo/issues/1"
+```
+
+Если указан только `issue_url`, репозиторий будет извлечен автоматически из ссылки.
+
+**Пример ответа:**
+```json
+{
+  "success": true,
+  "repository": {
+    "name": "repo",
+    "full_name": "owner/repo",
+    "url": "https://github.com/owner/repo"
+  },
+  "issue": {
+    "number": 1,
+    "title": "Название issue",
+    "body": "Описание issue",
+    "url": "https://github.com/owner/repo/issues/1",
+    "state": "open"
+  },
+  "technical_spec": "Созданное AI техническое задание...",
+  "message": "Issue #1 успешно проанализирована"
+}
+```
+
 ### Получить информацию о репозитории
 
 ```bash
@@ -105,6 +147,17 @@ GET /repo/<owner>/<repo>
 Пример:
 ```bash
 curl http://localhost:5000/repo/octocat/Hello-World
+```
+
+### Информация о возможностях агента
+
+```bash
+GET /
+```
+
+При обращении к корневому URL сервера вы получите информацию о всех возможностях агента:
+```bash
+curl http://your-server-ip:5000/
 ```
 
 ### Настройка Webhook
@@ -184,7 +237,9 @@ curl http://localhost:5000/repo/octocat/Hello-World
 
 ## API Endpoints
 
-- `GET /` - Информация о приложении
+- `GET /` - Информация о возможностях агента и доступных endpoints
+- `POST /analyze` - Прямой анализ issue по ссылкам (repo_url и issue_url)
+- `GET /analyze` - Анализ issue через query parameters (?issue_url=...)
 - `GET /repo/<owner>/<repo>` - Получить информацию о репозитории
 - `POST /webhook` - Webhook для GitHub событий
 - `GET /health` - Проверка работоспособности
