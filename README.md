@@ -9,7 +9,7 @@
 Отправьте POST запрос на `/fix-issue` с ссылкой на issue:
 
 ```bash
-curl -X POST http://your-server:5000/fix-issue \
+curl -X POST http://158.160.72.211:5000/fix-issue \
   -H "Content-Type: application/json" \
   -d '{
     "issue_url": "https://github.com/owner/repo/issues/1"
@@ -19,7 +19,7 @@ curl -X POST http://your-server:5000/fix-issue \
 Или с указанием owner и repo:
 
 ```bash
-curl -X POST http://your-server:5000/fix-issue \
+curl -X POST http://158.160.72.211:5000/fix-issue \
   -H "Content-Type: application/json" \
   -d '{
     "owner": "owner",
