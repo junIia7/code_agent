@@ -272,6 +272,8 @@ def index():
     """
     return jsonify({
         'name': 'GitHub Issue Analyzer Agent',
+        'pid': os.getpid(),
+        'file': __file__,
         'description': 'AI агент для анализа GitHub issues и создания технических заданий',
         'version': '1.0.0',
         'capabilities': [
