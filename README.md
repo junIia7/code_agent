@@ -34,6 +34,11 @@ curl -X POST http://your-server:5000/fix-issue \
 2. Настройте webhook URL в настройках GitHub App: `https://your-server/webhook`
 3. Создайте issue в репозитории - система автоматически обработает его через webhook
 
+Данные github app:
+1. App ID: 2760503
+2. Клиентский ID: Iv23ctCYCEorpUiWbMd7
+3. Ссылка для установки: https://github.com/settings/apps/fixissuesbot
+
 ### Что происходит при обработке
 
 1. Система получает данные issue из GitHub
