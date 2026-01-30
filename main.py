@@ -15,6 +15,21 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from agents import AGNOAgentSystem
+from github import (
+    get_github_app_private_key,
+    get_github_app_token,
+    get_installation_access_token,
+    find_installation_id_for_repo,
+    verify_webhook_signature,
+    parse_github_url,
+    get_issue_data,
+    get_repository_name,
+    get_repository_structure,
+    create_pr_from_branch,
+    create_pr_comment
+)
+from github.config import GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_APP_PRIVATE_KEY_PATH, GITHUB_INSTALLATION_ID, WEBHOOK_SECRET
+from ci.checker import check_ci_results_match
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -40,14 +55,32 @@ app = Flask(__name__)
 # Инициализация системы AGNO агентов
 agno_system = AGNOAgentSystem()
 
-# Конфигурация GitHub App
-GITHUB_APP_ID = os.getenv('GITHUB_APP_ID')
-GITHUB_APP_PRIVATE_KEY = os.getenv('GITHUB_APP_PRIVATE_KEY')
-GITHUB_APP_PRIVATE_KEY_PATH = os.getenv('GITHUB_APP_PRIVATE_KEY_PATH')
-GITHUB_INSTALLATION_ID = os.getenv('GITHUB_INSTALLATION_ID', '')
-WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+# Конфигурация GitHub App импортируется из github.config
 
-def get_github_app_private_key():
+# Удаляем старые функции, которые теперь в модулях github
+# def get_github_app_private_key(): - теперь в github.auth
+# def get_github_app_token(): - теперь в github.auth
+# def get_installation_access_token(): - теперь в github.auth
+# def find_installation_id_for_repo(): - теперь в github.auth
+# def verify_webhook_signature(): - теперь в github.webhook
+# def parse_github_url(): - теперь в github.webhook
+# def get_issue_data(): - теперь в github.api
+# def get_repository_name(): - теперь в github.api
+# def get_repository_structure(): - теперь в github.api
+# def create_pr_comment(): - теперь в github.branches
+# def create_pr_from_branch(): - теперь в github.branches
+
+# Все функции GitHub API теперь импортируются из модулей github
+# (см. импорты в начале файла)
+
+# Удалены дублирующие функции:
+# - get_github_app_private_key, get_github_app_token, get_installation_access_token, 
+#   find_installation_id_for_repo -> теперь в github.auth
+# - verify_webhook_signature, parse_github_url -> теперь в github.webhook
+# - get_issue_data, get_repository_name, get_repository_structure -> теперь в github.api
+# - create_pr_comment, create_pr_from_branch -> теперь в github.branches
+
+def _placeholder_removed():
     """
     Получает приватный ключ GitHub App из переменной окружения или файла
     
@@ -263,108 +296,9 @@ def parse_github_url(url):
     
     raise ValueError(f"Неверный формат GitHub URL: {url}")
 
-def get_issue_data(owner, repo, issue_number, installation_id=None):
-    """
-    Получает данные issue через GitHub API
-    
-    Args:
-        owner: Владелец репозитория
-        repo: Название репозитория
-        issue_number: Номер issue
-        installation_id: ID установки GitHub App (опционально)
-        
-    Returns:
-        dict с данными issue
-    """
-    if installation_id:
-        access_token = get_installation_access_token(installation_id)
-        headers = {
-            'Authorization': f'token {access_token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
-    else:
-        # Альтернативный способ: использование личного токена
-        personal_token = os.getenv('GITHUB_TOKEN')
-        if not personal_token:
-            raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-        headers = {
-            'Authorization': f'token {personal_token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
-    
-    url = f'https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}'
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code == 200:
-        issue_data = response.json()
-        return {
-            'number': issue_data['number'],
-            'title': issue_data['title'],
-            'body': issue_data.get('body', ''),
-            'state': issue_data['state'],
-            'url': issue_data['html_url'],
-            'created_at': issue_data['created_at'],
-            'user': issue_data['user']['login']
-        }
-    else:
-        raise Exception(f"Ошибка получения issue: {response.status_code} - {response.text}")
+# get_issue_data теперь импортируется из github.api
 
-def check_ci_results_match(ci_before, ci_after):
-    """
-    Проверяет, что результаты CI до и после изменений совпадают или улучшились
-    
-    Args:
-        ci_before: Результаты CI до изменений
-        ci_after: Результаты CI после изменений
-        
-    Returns:
-        dict с результатом проверки
-    """
-    before_summary = ci_before.get('summary', {}) if ci_before else {}
-    after_summary = ci_after.get('summary', {}) if ci_after else {}
-    
-    build_before = before_summary.get('build_passed')
-    test_before = before_summary.get('test_passed')
-    
-    build_after = after_summary.get('build_passed')
-    test_after = after_summary.get('test_passed')
-    
-    issues = []
-    recommendations = []
-    
-    # Проверяем синтаксис (используется build_passed для обратной совместимости)
-    if build_before is not None and build_after is not None:
-        if build_before and not build_after:
-            issues.append("Проверка синтаксиса проходила ДО изменений, но НЕ проходит ПОСЛЕ изменений")
-            recommendations.append("Исправить синтаксические ошибки, чтобы восстановить работоспособность проекта")
-        elif not build_before and build_after:
-            # Это улучшение - проверка синтаксиса начала проходить
-            pass
-    
-    # Проверяем тесты
-    if test_before is not None and test_after is not None:
-        if test_before and not test_after:
-            issues.append("Тесты проходили ДО изменений, но НЕ проходят ПОСЛЕ изменений")
-            recommendations.append("Исправить падающие тесты, чтобы восстановить работоспособность")
-        elif not test_before and test_after:
-            # Это улучшение - тесты начали проходить
-            pass
-    
-    # Если есть проблемы - результаты не совпадают
-    if issues:
-        reason = "; ".join(issues)
-        return {
-            'match': False,
-            'reason': reason,
-            'issues': issues,
-            'recommendations': recommendations
-        }
-    
-    # Если все совпадает или улучшилось
-    return {
-        'match': True,
-        'reason': 'Результаты CI совпадают или улучшились'
-    }
+# check_ci_results_match теперь импортируется из ci.checker
 
 def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, issue_body, 
                                        technical_spec, ci_commands, ci_before, installation_id=None, max_iterations=10):
@@ -784,236 +718,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
         'iteration': max_iterations
     }
 
-def create_pr_comment(owner, repo, pr_number, comment_body, installation_id=None):
-    """Создает комментарий в Pull Request"""
-    try:
-        if installation_id:
-            access_token = get_installation_access_token(installation_id)
-            headers = {
-                'Authorization': f'token {access_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        else:
-            personal_token = os.getenv('GITHUB_TOKEN')
-            if not personal_token:
-                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-            headers = {
-                'Authorization': f'token {personal_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        
-        comment_url = f'https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments'
-        comment_data = {
-            'body': comment_body
-        }
-        
-        comment_response = requests.post(comment_url, headers=headers, json=comment_data)
-        
-        if comment_response.status_code not in [201, 200]:
-            raise Exception(f"Не удалось создать комментарий: {comment_response.status_code} - {comment_response.text}")
-        
-        logger.info(f"✅ Комментарий добавлен в PR #{pr_number}")
-        return {
-            'success': True,
-            'comment_id': comment_response.json().get('id')
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка при создании комментария в PR: {str(e)}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
-
-def create_pr_from_branch(owner, repo, branch_name, default_branch, issue_number, 
-                          technical_spec, fixed_files, failed_files, installation_id=None, pr_number=None):
-    """Создает Pull Request из существующей ветки или возвращает существующий PR"""
-    try:
-        if installation_id:
-            access_token = get_installation_access_token(installation_id)
-            headers = {
-                'Authorization': f'token {access_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        else:
-            personal_token = os.getenv('GITHUB_TOKEN')
-            if not personal_token:
-                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-            headers = {
-                'Authorization': f'token {personal_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        
-        pr_url = f'https://api.github.com/repos/{owner}/{repo}/pulls'
-        
-        pr_title = f"Fix: решение для issue #{issue_number}"
-        files_list = '\n'.join([f"- `{f}`" for f in fixed_files])
-        pr_body = f"""## Описание
-Этот PR решает issue #{issue_number}
-
-## Изменения
-{files_list}
-
-## Техническое задание
-{technical_spec[:2000]}{'...' if len(technical_spec) > 2000 else ''}
-
-## Связанная issue
-Closes #{issue_number}
-"""
-        
-        if failed_files:
-            pr_body += f"\n## Предупреждения\nНе удалось обработать следующие файлы:\n"
-            for failed in failed_files:
-                pr_body += f"- `{failed['file']}`: {failed['error']}\n"
-        
-        pr_data = {
-            'title': pr_title,
-            'body': pr_body,
-            'head': branch_name,
-            'base': default_branch
-        }
-        
-        # Если передан pr_number, значит PR уже существует
-        if pr_number:
-            pr_get_url = f'https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}'
-            pr_get_response = requests.get(pr_get_url, headers=headers)
-            if pr_get_response.status_code == 200:
-                pr_data = pr_get_response.json()
-                pr_num = pr_data.get('number', pr_number)
-                html_url = pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                logger.info(f"ℹ️  Используется существующий PR: {html_url}")
-                return {
-                    'success': True,
-                    'pr_number': pr_num,
-                    'pr_url': html_url,
-                    'branch': branch_name
-                }
-        
-        # Проверяем существование ветки перед созданием PR
-        branch_check_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
-        branch_check_response = requests.get(branch_check_url, headers=headers)
-        
-        if branch_check_response.status_code != 200:
-            # Ветка не существует, создаем её
-            logger.info(f"🌿 Ветка {branch_name} не существует, создаем её...")
-            ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
-            ref_response = requests.get(ref_url, headers=headers)
-            
-            if ref_response.status_code != 200:
-                raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
-            
-            base_sha = ref_response.json()['object']['sha']
-            create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
-            branch_data = {
-                'ref': f'refs/heads/{branch_name}',
-                'sha': base_sha
-            }
-            branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
-            
-            if branch_response.status_code == 201:
-                logger.info(f"✅ Ветка {branch_name} создана")
-            elif branch_response.status_code == 422:
-                logger.info(f"ℹ️  Ветка {branch_name} уже существует")
-            else:
-                raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
-        
-        # Создаем PR
-        pr_response = requests.post(pr_url, headers=headers, json=pr_data)
-
-        # Успешное создание PR
-        if pr_response.status_code == 201:
-            try:
-                pr_response_data = pr_response.json()
-                pr_num = pr_response_data.get('number')
-                if not pr_num:
-                    raise ValueError("Ответ не содержит номер PR")
-                html_url = pr_response_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                logger.info(f"✅ Pull Request создан: #{pr_num} - {html_url}")
-                
-                return {
-                    'success': True,
-                    'pr_number': pr_num,
-                    'pr_url': html_url,
-                    'branch': branch_name
-                }
-            except (KeyError, ValueError, TypeError) as json_error:
-                logger.error(f"❌ Ошибка парсинга ответа PR: {str(json_error)}")
-                logger.error(f"❌ Ответ сервера: {pr_response.text[:500]}")
-                raise Exception(f"Не удалось распарсить ответ при создании PR: {str(json_error)}")
-
-        # Ошибка 422 может означать либо что PR уже существует, либо что ветка не существует
-        elif pr_response.status_code == 422:
-            error_text = pr_response.text.lower()
-            
-            # Проверяем, существует ли ветка
-            branch_check_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
-            branch_check_response = requests.get(branch_check_url, headers=headers)
-            
-            if branch_check_response.status_code != 200:
-                # Ветка не существует - это основная причина ошибки
-                logger.error(f"❌ Ветка {branch_name} не существует. Нельзя создать PR без ветки.")
-                raise Exception(f"Ветка {branch_name} не существует. Сначала создайте ветку и закоммитьте изменения, затем создайте PR.")
-            
-            # Ветка существует, значит проблема в том, что PR уже существует
-            # Получаем существующий PR - сначала пробуем открытые
-            existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
-            existing_prs_response = requests.get(existing_prs_url, headers=headers)
-            
-            if existing_prs_response.status_code == 200:
-                existing_prs = existing_prs_response.json()
-                if existing_prs:
-                    existing_pr_data = existing_prs[0]
-                    pr_num = existing_pr_data.get('number')
-                    html_url = existing_pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                    logger.info(f"ℹ️  PR уже существует (открыт): {html_url}")
-                    return {
-                        'success': True,
-                        'pr_number': pr_num,
-                        'pr_url': html_url,
-                        'branch': branch_name
-                    }
-            
-            # Если не нашли среди открытых, пробуем все (включая закрытые/мердженные)
-            existing_prs_url_all = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=all'
-            existing_prs_response_all = requests.get(existing_prs_url_all, headers=headers)
-            
-            if existing_prs_response_all.status_code == 200:
-                existing_prs_all = existing_prs_response_all.json()
-                if existing_prs_all:
-                    existing_pr_data = existing_prs_all[0]
-                    pr_num = existing_pr_data.get('number')
-                    html_url = existing_pr_data.get('html_url') or f'https://github.com/{owner}/{repo}/pull/{pr_num}'
-                    state = existing_pr_data.get('state', 'unknown')
-                    logger.info(f"ℹ️  PR уже существует (статус: {state}): {html_url}")
-                    return {
-                        'success': True,
-                        'pr_number': pr_num,
-                        'pr_url': html_url,
-                        'branch': branch_name
-                    }
-            
-            # Логируем детали для отладки
-            logger.error(f"❌ Не удалось получить существующий PR для ветки {branch_name}")
-            logger.error(f"❌ Ответ GitHub API (422): {pr_response.text[:500]}")
-            if existing_prs_response.status_code != 200:
-                logger.error(f"❌ Ошибка при запросе открытых PR: {existing_prs_response.status_code} - {existing_prs_response.text[:500]}")
-            if existing_prs_response_all.status_code != 200:
-                logger.error(f"❌ Ошибка при запросе всех PR: {existing_prs_response_all.status_code} - {existing_prs_response_all.text[:500]}")
-            
-            # Не удалось получить существующий PR
-            raise Exception(f"PR уже существует (статус 422), но не удалось его получить. Проверьте ветку {branch_name} в репозитории {owner}/{repo}")
-
-        # Другие ошибки
-        else:
-            error_text = pr_response.text
-            logger.error(f"❌ Ошибка создания PR: {pr_response.status_code} - {error_text}")
-            raise Exception(f"Не удалось создать PR: {pr_response.status_code} - {error_text}")
-    
-    except Exception as e:
-        logger.error(f"❌ Ошибка при создании PR: {str(e)}")
-        import traceback
-        logger.error(f"❌ Детали ошибки: {traceback.format_exc()}")
-        raise
+# create_pr_comment и create_pr_from_branch теперь импортируются из github.branches
 
 
 def auto_fix_and_create_pr(owner, repo, issue_number, technical_spec, installation_id=None):
@@ -1443,140 +1148,7 @@ Closes #{issue_number}
         logger.error(f"❌ Ошибка при создании PR: {str(e)}")
         raise
 
-def get_repository_structure(owner, repo, branch='main', installation_id=None, max_depth=2):
-    """
-    Получает структуру репозитория (список файлов и директорий)
-    
-    Args:
-        owner: Владелец репозитория
-        repo: Название репозитория
-        branch: Ветка (по умолчанию main)
-        installation_id: ID установки GitHub App
-        max_depth: Максимальная глубина для анализа
-        
-    Returns:
-        dict с информацией о структуре репозитория
-    """
-    try:
-        if installation_id:
-            access_token = get_installation_access_token(installation_id)
-            headers = {
-                'Authorization': f'token {access_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        else:
-            personal_token = os.getenv('GITHUB_TOKEN')
-            if not personal_token:
-                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-            headers = {
-                'Authorization': f'token {personal_token}',
-                'Accept': 'application/vnd.github.v3+json'
-            }
-        
-        # Получаем дерево репозитория
-        repo_url = f'https://api.github.com/repos/{owner}/{repo}'
-        repo_response = requests.get(repo_url, headers=headers)
-        
-        if repo_response.status_code != 200:
-            raise Exception(f"Не удалось получить информацию о репозитории: {repo_response.status_code}")
-        
-        repo_data = repo_response.json()
-        default_branch = repo_data.get('default_branch', branch)
-        
-        # Получаем SHA последнего коммита
-        ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
-        ref_response = requests.get(ref_url, headers=headers)
-        
-        if ref_response.status_code != 200:
-            raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
-        
-        commit_sha = ref_response.json()['object']['sha']
-        
-        # Получаем дерево коммита (рекурсивно для полного анализа)
-        tree_url = f'https://api.github.com/repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1'
-        tree_response = requests.get(tree_url, headers=headers)
-        
-        if tree_response.status_code != 200:
-            raise Exception(f"Не удалось получить дерево репозитория: {tree_response.status_code}")
-        
-        tree_data = tree_response.json()
-        files = []
-        
-        # Важные файлы и директории, которые нужно включить независимо от глубины
-        important_patterns = [
-            'package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 
-            'go.mod', 'Makefile', 'Dockerfile', '.github', 'test', 'tests', 'spec', 
-            'specs', 'pytest.ini', 'tox.ini', 'jest.config', 'vitest.config', 
-            '.mocharc', 'setup.py', 'pyproject.toml', 'tsconfig.json', 'webpack.config',
-            'docker-compose.yml', '.gitignore', 'README', 'CONTRIBUTING'
-        ]
-        
-        for item in tree_data.get('tree', []):
-            if item['type'] == 'blob':  # файл
-                path = item['path']
-                depth = path.count('/')
-                # Включаем файлы до max_depth или важные файлы
-                if depth <= max_depth or any(pattern in path.lower() for pattern in important_patterns):
-                    files.append({
-                        'path': path,
-                        'type': 'file',
-                        'size': item.get('size', 0)
-                    })
-            elif item['type'] == 'tree':  # директория
-                path = item['path']
-                depth = path.count('/')
-                # Включаем директории до max_depth или важные директории
-                if depth <= max_depth or any(pattern in path.lower() for pattern in important_patterns):
-                    files.append({
-                        'path': path,
-                        'type': 'directory'
-                    })
-        
-        # Получаем содержимое ключевых файлов для определения типа проекта
-        key_files = {}
-        key_file_patterns = [
-            'package.json', 'package-lock.json', 'yarn.lock',
-            'requirements.txt', 'requirements-dev.txt', 'setup.py', 'pyproject.toml', 'Pipfile',
-            'pom.xml', 'build.gradle', 'build.gradle.kts', 'settings.gradle',
-            'Cargo.toml', 'Cargo.lock',
-            'go.mod', 'go.sum',
-            'Makefile', 'Makefile.am', 'CMakeLists.txt',
-            'Dockerfile', 'docker-compose.yml', 'docker-compose.yaml',
-            'tsconfig.json', 'webpack.config.js', 'vite.config.js',
-            'pytest.ini', 'tox.ini', 'setup.cfg',
-            'jest.config.js', 'jest.config.ts', 'vitest.config.js', 'vitest.config.ts',
-            '.mocharc.js', '.mocharc.json',
-            'README.md', 'README.rst', 'README.txt'
-        ]
-        
-        for file_path in key_file_patterns:
-            for item in tree_data.get('tree', []):
-                if item['type'] == 'blob' and item['path'] == file_path:
-                    # Получаем содержимое файла
-                    file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={default_branch}'
-                    file_response = requests.get(file_url, headers=headers)
-                    if file_response.status_code == 200:
-                        file_data = file_response.json()
-                        content = base64.b64decode(file_data['content']).decode('utf-8')
-                        key_files[file_path] = content[:5000]  # Ограничиваем размер
-                    break
-        
-        return {
-            'success': True,
-            'files': files,
-            'key_files': key_files,
-            'language': repo_data.get('language', ''),
-            'default_branch': default_branch
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка при получении структуры репозитория: {str(e)}")
-        return {
-            'success': False,
-            'error': str(e),
-            'files': [],
-            'key_files': {}
-        }
+# get_repository_structure теперь импортируется из github.api
 
 def check_tests_exist(files, key_files):
     """
@@ -2004,42 +1576,7 @@ def run_ci_commands(owner, repo, branch, commands, installation_id=None):
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось удалить временную директорию: {str(e)}")
 
-def get_repository_name(owner, repo, installation_id=None):
-    """
-    Получает название репозитория через GitHub API
-    """
-    if installation_id:
-        access_token = get_installation_access_token(installation_id)
-        headers = {
-            'Authorization': f'token {access_token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
-    else:
-        # Альтернативный способ: использование личного токена
-        personal_token = os.getenv('GITHUB_TOKEN')
-        if not personal_token:
-            raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
-        headers = {
-            'Authorization': f'token {personal_token}',
-            'Accept': 'application/vnd.github.v3+json'
-        }
-    
-    url = f'https://api.github.com/repos/{owner}/{repo}'
-    response = requests.get(url, headers=headers)
-    
-    if response.status_code == 200:
-        repo_data = response.json()
-        return {
-            'name': repo_data['name'],
-            'full_name': repo_data['full_name'],
-            'description': repo_data.get('description', ''),
-            'url': repo_data['html_url'],
-            'language': repo_data.get('language', ''),
-            'stars': repo_data['stargazers_count'],
-            'forks': repo_data['forks_count']
-        }
-    else:
-        raise Exception(f"Ошибка получения данных репозитория: {response.status_code} - {response.text}")
+# get_repository_name теперь импортируется из github.api
 
 @app.route('/')
 def index():
