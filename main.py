@@ -389,6 +389,7 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
     repo_full_name = f"{owner}/{repo}"
     current_spec = technical_spec
     iteration = 0
+    pr_number = None  # Номер PR, создается на первой итерации
     
     while iteration < max_iterations:
         iteration += 1
@@ -453,46 +454,87 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
             repo_data = repo_response.json()
             default_branch = repo_data.get('default_branch', 'main')
             
-            # 4. Создаем имя ветки
+            # 4. Создаем имя ветки (одна ветка для всех итераций)
             branch_name = f"fix/issue-{issue_number}"
-            if iteration > 1:
-                branch_name = f"fix/issue-{issue_number}-iter{iteration}"
             if len(branch_name) > 200:
                 branch_name = branch_name[:200]
             
             logger.info(f"🌿 Создание/обновление ветки {branch_name}...")
             
-            # 5. Получаем SHA последнего коммита в основной ветке
-            ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+            # 4.1. Создаем PR на первой итерации (до изменений файлов)
+            if iteration == 1 and pr_number is None:
+                logger.info(f"🔀 Создание Pull Request на первой итерации...")
+                try:
+                    # Получаем SHA последнего коммита в основной ветке
+                    ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+                    ref_response = requests.get(ref_url, headers=headers)
+                    if ref_response.status_code == 200:
+                        base_sha = ref_response.json()['object']['sha']
+                        
+                        # Создаем ветку, если её нет
+                        create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
+                        branch_data = {
+                            'ref': f'refs/heads/{branch_name}',
+                            'sha': base_sha
+                        }
+                        branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
+                        
+                        if branch_response.status_code not in [201, 422]:
+                            if branch_response.status_code == 422:
+                                logger.info(f"ℹ️  Ветка {branch_name} уже существует")
+                            else:
+                                logger.warning(f"⚠️ Не удалось создать ветку для PR: {branch_response.status_code}")
+                        
+                        # Создаем PR с пустым списком файлов (файлы будут добавлены позже)
+                        pr_result = create_pr_from_branch(
+                            owner=owner,
+                            repo=repo,
+                            branch_name=branch_name,
+                            default_branch=default_branch,
+                            issue_number=issue_number,
+                            technical_spec=current_spec,
+                            fixed_files=[],
+                            failed_files=[],
+                            installation_id=installation_id
+                        )
+                        
+                        if pr_result.get('success'):
+                            pr_number = pr_result.get('pr_number')
+                            logger.info(f"✅ PR создан: #{pr_number} - {pr_result.get('pr_url')}")
+                        else:
+                            logger.warning(f"⚠️ Не удалось создать PR: {pr_result.get('error')}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка при создании PR на первой итерации: {str(e)}")
+            
+            # 5. Получаем SHA последнего коммита в ветке (или основной ветке, если ветка не существует)
+            ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
             ref_response = requests.get(ref_url, headers=headers)
             
-            if ref_response.status_code != 200:
-                raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
-            
-            base_sha = ref_response.json()['object']['sha']
-            
-            # 6. Создаем или обновляем ветку
-            create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
-            branch_data = {
-                'ref': f'refs/heads/{branch_name}',
-                'sha': base_sha
-            }
-            branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
-            
-            if branch_response.status_code not in [201, 422]:
-                if branch_response.status_code == 422:
-                    # Ветка уже существует, получаем её SHA
-                    existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
-                    existing_response = requests.get(existing_branch_url, headers=headers)
-                    if existing_response.status_code == 200:
-                        base_sha = existing_response.json()['object']['sha']
-                        logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
-                    else:
-                        raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
-                else:
-                    raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
+            if ref_response.status_code == 200:
+                base_sha = ref_response.json()['object']['sha']
+                logger.info(f"ℹ️  Ветка {branch_name} существует, используем её")
             else:
-                logger.info(f"✅ Ветка {branch_name} создана")
+                # Ветка не существует, создаем её от основной ветки
+                default_ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+                default_ref_response = requests.get(default_ref_url, headers=headers)
+                
+                if default_ref_response.status_code != 200:
+                    raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {default_ref_response.status_code}")
+                
+                base_sha = default_ref_response.json()['object']['sha']
+                
+                # Создаем ветку
+                create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
+                branch_data = {
+                    'ref': f'refs/heads/{branch_name}',
+                    'sha': base_sha
+                }
+                branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
+                
+                if branch_response.status_code not in [201, 422]:
+                    raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
+                else:
+                    logger.info(f"✅ Ветка {branch_name} создана")
             
             # 7. Для каждого файла получаем код, исправляем и обновляем
             fixed_files = []
@@ -623,27 +665,65 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                         review_result['approved'] = False
                         review_result['reason'] = f"Автоматическое отклонение: {ci_match_result.get('reason')}"
             
+            # 11. Добавляем комментарий от Reviewer в PR
+            if pr_number:
+                logger.info(f"💬 Добавление комментария Reviewer в PR #{pr_number}...")
+                
+                # Формируем комментарий от Reviewer
+                review_comment = f"""## 👀 Review - Итерация {iteration}
+
+**Вердикт:** {'✅ Одобрено' if review_result.get('approved') else '❌ Отклонено'}
+
+**Причина:** {review_result.get('reason', 'Не указана')}
+
+"""
+                
+                if review_result.get('issues'):
+                    review_comment += f"**Проблемы:**\n"
+                    for issue in review_result.get('issues', []):
+                        review_comment += f"- {issue}\n"
+                    review_comment += "\n"
+                
+                if review_result.get('recommendations'):
+                    review_comment += f"**Рекомендации:**\n"
+                    for rec in review_result.get('recommendations', []):
+                        review_comment += f"- {rec}\n"
+                    review_comment += "\n"
+                
+                # Добавляем информацию о CI
+                review_comment += f"**Результаты CI:**\n"
+                review_comment += f"- Проверка синтаксиса: {'✅' if ci_after.get('summary', {}).get('build_passed') else '❌'}\n"
+                review_comment += f"- Тесты: {'✅' if ci_after.get('summary', {}).get('test_passed') else '❌'}\n"
+                
+                create_pr_comment(owner, repo, pr_number, review_comment, installation_id)
+            
             if review_result.get('success') and review_result.get('approved'):
                 logger.info(f"✅ Reviewer одобрил изменения!")
                 
-                # Создаем Pull Request
-                logger.info(f"🔀 Создание Pull Request...")
-                pr_result = create_pr_from_branch(
-                    owner=owner,
-                    repo=repo,
-                    branch_name=branch_name,
-                    default_branch=default_branch,
-                    issue_number=issue_number,
-                    technical_spec=current_spec,
-                    fixed_files=fixed_files,
-                    failed_files=failed_files,
-                    installation_id=installation_id
-                )
+                # Добавляем комментарий о качестве кода, если есть результаты
+                if pr_number and ci_after.get('results', {}).get('quality'):
+                    quality_result = ci_after.get('results', {}).get('quality', {})
+                    quality_passed = quality_result.get('success')
+                    
+                    quality_comment = f"""## 📊 Анализ качества кода
+
+**Статус:** {'✅ Проверка пройдена' if quality_passed else '⚠️ Есть замечания'}
+
+"""
+                    if quality_result.get('output'):
+                        quality_comment += f"**Результаты проверки:**\n```\n{quality_result.get('output', '')[:2000]}\n```\n"
+                    
+                    if quality_result.get('error'):
+                        quality_comment += f"**Предупреждения:**\n```\n{quality_result.get('error', '')[:1000]}\n```\n"
+                    
+                    quality_comment += "\n*Примечание: Качество кода не влияет на решение Reviewer, только синтаксис и тесты.*"
+                    
+                    create_pr_comment(owner, repo, pr_number, quality_comment, installation_id)
                 
                 return {
                     'success': True,
-                    'pr_number': pr_result.get('pr_number'),
-                    'pr_url': pr_result.get('pr_url'),
+                    'pr_number': pr_number,
+                    'pr_url': f'https://github.com/{owner}/{repo}/pull/{pr_number}' if pr_number else None,
                     'branch': branch_name,
                     'fixed_files': fixed_files,
                     'failed_files': failed_files,
@@ -659,7 +739,8 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
                         'success': False,
                         'error': f'Не удалось получить одобрение Reviewer после {max_iterations} итераций',
                         'review': review_result,
-                        'iteration': iteration
+                        'iteration': iteration,
+                        'pr_number': pr_number
                     }
                 
                 # Создаем новое ТЗ на основе проблем от Reviewer
@@ -720,9 +801,50 @@ def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, i
         'iteration': max_iterations
     }
 
+def create_pr_comment(owner, repo, pr_number, comment_body, installation_id=None):
+    """Создает комментарий в Pull Request"""
+    try:
+        if installation_id:
+            access_token = get_installation_access_token(installation_id)
+            headers = {
+                'Authorization': f'token {access_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        else:
+            personal_token = os.getenv('GITHUB_TOKEN')
+            if not personal_token:
+                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+            headers = {
+                'Authorization': f'token {personal_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        
+        comment_url = f'https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments'
+        comment_data = {
+            'body': comment_body
+        }
+        
+        comment_response = requests.post(comment_url, headers=headers, json=comment_data)
+        
+        if comment_response.status_code not in [201, 200]:
+            raise Exception(f"Не удалось создать комментарий: {comment_response.status_code} - {comment_response.text}")
+        
+        logger.info(f"✅ Комментарий добавлен в PR #{pr_number}")
+        return {
+            'success': True,
+            'comment_id': comment_response.json().get('id')
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при создании комментария в PR: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
 def create_pr_from_branch(owner, repo, branch_name, default_branch, issue_number, 
-                          technical_spec, fixed_files, failed_files, installation_id=None):
-    """Создает Pull Request из существующей ветки"""
+                          technical_spec, fixed_files, failed_files, installation_id=None, pr_number=None):
+    """Создает Pull Request из существующей ветки или возвращает существующий PR"""
     try:
         if installation_id:
             access_token = get_installation_access_token(installation_id)
@@ -2040,7 +2162,7 @@ def analyze_issue():
                         logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
                         ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
                     else:
-                        logger.info(f"✅ CI до изменений: синтаксис={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                        logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
                 
                 # Автоматически исправляем код, проверяем через Reviewer и создаем PR
                 logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
@@ -2258,7 +2380,7 @@ def webhook():
                             logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
                             ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
                         else:
-                            logger.info(f"✅ CI до изменений: синтаксис={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                            logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
                     
                     # Автоматически исправляем код, проверяем через Reviewer и создаем PR
                     logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
