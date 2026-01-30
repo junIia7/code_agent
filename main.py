@@ -54,15 +54,33 @@ def get_github_app_private_key():
     # Сначала проверяем путь к файлу
     if GITHUB_APP_PRIVATE_KEY_PATH:
         try:
-            if os.path.exists(GITHUB_APP_PRIVATE_KEY_PATH):
-                with open(GITHUB_APP_PRIVATE_KEY_PATH, 'r', encoding='utf-8') as f:
+            # Очищаем путь от пробелов и кавычек
+            key_path = GITHUB_APP_PRIVATE_KEY_PATH.strip().strip('"').strip("'")
+            
+            # Если путь относительный, делаем его относительно рабочей директории приложения
+            if not os.path.isabs(key_path):
+                # Получаем директорию, где находится main.py
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+                key_path = os.path.join(app_dir, key_path)
+                # Нормализуем путь (убираем .. и .)
+                key_path = os.path.normpath(key_path)
+            
+            logger.info(f"🔍 Проверка файла с приватным ключом: {key_path}")
+            logger.info(f"📂 Рабочая директория: {os.getcwd()}")
+            logger.info(f"📂 Директория приложения: {os.path.dirname(os.path.abspath(__file__))}")
+            
+            if os.path.exists(key_path):
+                with open(key_path, 'r', encoding='utf-8') as f:
                     private_key = f.read()
-                logger.info(f"✅ Приватный ключ загружен из файла: {GITHUB_APP_PRIVATE_KEY_PATH}")
+                logger.info(f"✅ Приватный ключ загружен из файла: {key_path}")
                 return private_key
             else:
-                logger.warning(f"⚠️  Файл с приватным ключом не найден: {GITHUB_APP_PRIVATE_KEY_PATH}")
+                logger.warning(f"⚠️  Файл с приватным ключом не найден: {key_path}")
+                logger.warning(f"⚠️  Проверьте, что путь указан правильно в .env файле")
         except Exception as e:
             logger.error(f"❌ Ошибка при чтении файла с приватным ключом: {str(e)}")
+            import traceback
+            logger.error(f"❌ Детали ошибки: {traceback.format_exc()}")
     
     # Если путь к файлу не указан или файл не найден, используем переменную окружения
     if GITHUB_APP_PRIVATE_KEY:
