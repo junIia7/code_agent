@@ -280,12 +280,160 @@ class CodeDeveloperAgent(AGNOAgent):
             }
 
 
+class ReviewerAgent(AGNOAgent):
+    """Агент-ревьюер: проверяет изменения и дает вердикт"""
+    
+    def __init__(self):
+        instructions = """Ты - опытный code reviewer, который проверяет изменения в коде.
+
+Твоя задача:
+1. Изучить исходную задачу (issue)
+2. Проанализировать техническое задание
+3. Проверить внесенные изменения
+4. Сравнить результаты CI до и после изменений
+5. Дать вердикт: принимается решение или нет
+
+Критерии принятия:
+- ОБЯЗАТЕЛЬНО: Сборка проекта должна работать так же, как до изменений (или лучше)
+- ОБЯЗАТЕЛЬНО: Тесты должны проходить так же, как до изменений (или лучше)
+- ОПЦИОНАЛЬНО: Качество кода не должно ухудшиться (но это не решающий фактор)
+
+Если изменения не соответствуют критериям, ты должен:
+- Четко описать проблему
+- Указать, что именно не работает
+- Дать рекомендации по исправлению
+
+Формат ответа должен быть JSON:
+{
+    "approved": true/false,
+    "reason": "краткое объяснение вердикта",
+    "issues": ["список проблем, если есть"],
+    "recommendations": ["рекомендации по исправлению, если есть"]
+}"""
+        
+        super().__init__(
+            name="Reviewer",
+            role="Code Reviewer",
+            instructions=instructions
+        )
+    
+    def process(self, input_data: Dict) -> Dict:
+        """Проверяет изменения и дает вердикт"""
+        try:
+            issue_title = input_data.get('issue_title', '')
+            issue_body = input_data.get('issue_body', '')
+            technical_spec = input_data.get('technical_spec', '')
+            changed_files = input_data.get('changed_files', [])
+            ci_before = input_data.get('ci_before', {})
+            ci_after = input_data.get('ci_after', {})
+            repository_name = input_data.get('repository_name', '')
+            
+            # Формируем запрос для проверки
+            prompt = f"""
+РЕПОЗИТОРИЙ: {repository_name}
+
+ИСХОДНАЯ ЗАДАЧА:
+Название: {issue_title}
+Описание: {issue_body}
+
+ТЕХНИЧЕСКОЕ ЗАДАНИЕ:
+{technical_spec}
+
+ИЗМЕНЕННЫЕ ФАЙЛЫ:
+{', '.join(changed_files) if changed_files else 'Не указаны'}
+
+РЕЗУЛЬТАТЫ CI ДО ИЗМЕНЕНИЙ:
+Сборка: {'✅ Успешно' if ci_before.get('summary', {}).get('build_passed') else '❌ Ошибка'}
+Тесты: {'✅ Успешно' if ci_before.get('summary', {}).get('test_passed') else '❌ Ошибка'}
+Качество: {'✅ Успешно' if ci_before.get('summary', {}).get('quality_passed') else '⚠️ Предупреждения' if ci_before.get('summary', {}).get('quality_passed') is False else 'Не проверялось'}
+
+РЕЗУЛЬТАТЫ CI ПОСЛЕ ИЗМЕНЕНИЙ:
+Сборка: {'✅ Успешно' if ci_after.get('summary', {}).get('build_passed') else '❌ Ошибка'}
+Тесты: {'✅ Успешно' if ci_after.get('summary', {}).get('test_passed') else '❌ Ошибка'}
+Качество: {'✅ Успешно' if ci_after.get('summary', {}).get('quality_passed') else '⚠️ Предупреждения' if ci_after.get('summary', {}).get('quality_passed') is False else 'Не проверялось'}
+
+ДЕТАЛИ ОШИБОК (если есть):
+{self._format_ci_details(ci_after)}
+
+Проверь изменения и дай вердикт. Отвечай ТОЛЬКО JSON объектом в указанном формате.
+"""
+            
+            logger.info(f"🤖 {self.name}: Проверяю изменения...")
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.instructions},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0
+            )
+            
+            review_text = response.choices[0].message.content.strip()
+            
+            # Извлекаем JSON
+            if "```json" in review_text:
+                review_text = review_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in review_text:
+                review_text = review_text.split("```")[1].split("```")[0].strip()
+            
+            try:
+                review_result = json.loads(review_text)
+                logger.info(f"✅ {self.name}: Вердикт - {'✅ Одобрено' if review_result.get('approved') else '❌ Отклонено'}")
+                return {
+                    'success': True,
+                    'approved': review_result.get('approved', False),
+                    'reason': review_result.get('reason', ''),
+                    'issues': review_result.get('issues', []),
+                    'recommendations': review_result.get('recommendations', []),
+                    'agent': self.name
+                }
+            except json.JSONDecodeError as e:
+                logger.warning(f"⚠️ Не удалось распарсить JSON ответ ревьюера: {e}")
+                # Пытаемся определить вердикт по тексту
+                approved = 'approved' in review_text.lower() or 'принято' in review_text.lower() or 'одобрено' in review_text.lower()
+                return {
+                    'success': True,
+                    'approved': approved,
+                    'reason': review_text[:500],
+                    'issues': [],
+                    'recommendations': [],
+                    'agent': self.name
+                }
+            
+        except Exception as e:
+            logger.error(f"❌ {self.name}: Ошибка при проверке - {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'approved': False,
+                'agent': self.name
+            }
+    
+    def _format_ci_details(self, ci_results):
+        """Форматирует детали результатов CI для промпта"""
+        if not ci_results or not ci_results.get('results'):
+            return "Нет деталей"
+        
+        details = []
+        results = ci_results.get('results', {})
+        
+        if not results.get('build', {}).get('success'):
+            details.append(f"Ошибка сборки:\n{results['build'].get('error', '')[:500]}")
+        
+        if not results.get('test', {}).get('success'):
+            details.append(f"Ошибка тестов:\n{results['test'].get('error', '')[:500]}")
+        
+        return "\n\n".join(details) if details else "Все проверки прошли успешно"
+
+
 class AGNOAgentSystem:
     """Система управления агентами AGNO"""
     
     def __init__(self):
         self.analyzer = IssueAnalyzerAgent()
         self.developer = CodeDeveloperAgent()
+        self.reviewer = ReviewerAgent()
         logger.info("🚀 Система AGNO агентов инициализирована")
     
     def analyze_issue(self, issue_title: str, issue_body: str, repository_name: str) -> Dict:
@@ -306,6 +454,20 @@ class AGNOAgentSystem:
             'repository_name': repository_name
         }
         return self.developer.process(input_data)
+    
+    def review_changes(self, issue_title: str, issue_body: str, technical_spec: str, 
+                      changed_files: list, ci_before: Dict, ci_after: Dict, repository_name: str) -> Dict:
+        """Проверяет изменения через агента-ревьюера"""
+        input_data = {
+            'issue_title': issue_title,
+            'issue_body': issue_body,
+            'technical_spec': technical_spec,
+            'changed_files': changed_files,
+            'ci_before': ci_before,
+            'ci_after': ci_after,
+            'repository_name': repository_name
+        }
+        return self.reviewer.process(input_data)
     
     def determine_files_to_change(self, technical_spec: str, repository_name: str) -> Dict:
         """Определяет список файлов, которые нужно изменить на основе ТЗ"""

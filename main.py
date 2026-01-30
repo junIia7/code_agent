@@ -8,6 +8,9 @@ import re
 import base64
 import logging
 import requests
+import subprocess
+import tempfile
+import shutil
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -305,6 +308,419 @@ def get_issue_data(owner, repo, issue_number, installation_id=None):
         }
     else:
         raise Exception(f"Ошибка получения issue: {response.status_code} - {response.text}")
+
+def auto_fix_and_create_pr_with_review(owner, repo, issue_number, issue_title, issue_body, 
+                                       technical_spec, ci_commands, ci_before, installation_id=None, max_iterations=10):
+    """
+    Автоматически исправляет код, проверяет через Reviewer и создает PR с циклом итераций
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        issue_number: Номер issue
+        issue_title: Название issue
+        issue_body: Описание issue
+        technical_spec: Техническое задание
+        ci_commands: Команды для CI
+        ci_before: Результаты CI до изменений
+        installation_id: ID установки GitHub App
+        max_iterations: Максимальное количество итераций
+        
+    Returns:
+        dict с информацией о созданном PR или ошибке
+    """
+    repo_full_name = f"{owner}/{repo}"
+    current_spec = technical_spec
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🔄 ИТЕРАЦИЯ {iteration}/{max_iterations}")
+        logger.info(f"{'='*80}\n")
+        
+        try:
+            # 1. Определяем файлы для изменения
+            logger.info("🔍 Определяю файлы для изменения на основе ТЗ...")
+            files_result = agno_system.determine_files_to_change(current_spec, repo_full_name)
+            
+            if not files_result.get('success'):
+                logger.error(f"❌ Ошибка при определении файлов: {files_result.get('error')}")
+                return {
+                    'success': False,
+                    'error': f"Не удалось определить файлы: {files_result.get('error')}",
+                    'iteration': iteration
+                }
+            
+            files_to_change = files_result.get('files', [])
+            
+            if not files_to_change:
+                logger.warning("⚠️ Не удалось определить файлы для изменения.")
+                if iteration == 1:
+                    return {
+                        'success': False,
+                        'error': 'Не удалось определить файлы для изменения из технического задания',
+                        'technical_spec': current_spec
+                    }
+                else:
+                    # Если это не первая итерация, возможно нужно уточнить ТЗ
+                    logger.info("🔄 Пытаюсь уточнить техническое задание...")
+                    # Создаем новое ТЗ на основе предыдущих проблем
+                    continue
+            
+            logger.info(f"📋 Найдено {len(files_to_change)} файлов для изменения: {files_to_change}")
+            
+            # 2. Получаем access token
+            if installation_id:
+                access_token = get_installation_access_token(installation_id)
+                headers = {
+                    'Authorization': f'token {access_token}',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+            else:
+                personal_token = os.getenv('GITHUB_TOKEN')
+                if not personal_token:
+                    raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+                headers = {
+                    'Authorization': f'token {personal_token}',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+            
+            # 3. Получаем информацию о репозитории
+            repo_url = f'https://api.github.com/repos/{owner}/{repo}'
+            repo_response = requests.get(repo_url, headers=headers)
+            
+            if repo_response.status_code != 200:
+                raise Exception(f"Не удалось получить информацию о репозитории: {repo_response.status_code}")
+            
+            repo_data = repo_response.json()
+            default_branch = repo_data.get('default_branch', 'main')
+            
+            # 4. Создаем имя ветки
+            branch_name = f"fix/issue-{issue_number}"
+            if iteration > 1:
+                branch_name = f"fix/issue-{issue_number}-iter{iteration}"
+            if len(branch_name) > 200:
+                branch_name = branch_name[:200]
+            
+            logger.info(f"🌿 Создание/обновление ветки {branch_name}...")
+            
+            # 5. Получаем SHA последнего коммита в основной ветке
+            ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+            ref_response = requests.get(ref_url, headers=headers)
+            
+            if ref_response.status_code != 200:
+                raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
+            
+            base_sha = ref_response.json()['object']['sha']
+            
+            # 6. Создаем или обновляем ветку
+            create_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/refs'
+            branch_data = {
+                'ref': f'refs/heads/{branch_name}',
+                'sha': base_sha
+            }
+            branch_response = requests.post(create_branch_url, headers=headers, json=branch_data)
+            
+            if branch_response.status_code not in [201, 422]:
+                if branch_response.status_code == 422:
+                    # Ветка уже существует, получаем её SHA
+                    existing_branch_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch_name}'
+                    existing_response = requests.get(existing_branch_url, headers=headers)
+                    if existing_response.status_code == 200:
+                        base_sha = existing_response.json()['object']['sha']
+                        logger.info(f"ℹ️  Ветка {branch_name} уже существует, используем её")
+                    else:
+                        raise Exception(f"Ветка существует, но не удалось получить её SHA: {existing_response.status_code}")
+                else:
+                    raise Exception(f"Не удалось создать ветку: {branch_response.status_code} - {branch_response.text}")
+            else:
+                logger.info(f"✅ Ветка {branch_name} создана")
+            
+            # 7. Для каждого файла получаем код, исправляем и обновляем
+            fixed_files = []
+            failed_files = []
+            
+            for file_path in files_to_change:
+                try:
+                    logger.info(f"📥 Получение кода файла {file_path}...")
+                    
+                    # Получаем содержимое файла из основной ветки
+                    file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={default_branch}'
+                    file_response = requests.get(file_url, headers=headers)
+                    
+                    if file_response.status_code != 200:
+                        logger.warning(f"⚠️ Не удалось получить файл {file_path}: {file_response.status_code}")
+                        failed_files.append({'file': file_path, 'error': f'Не удалось получить файл: {file_response.status_code}'})
+                        continue
+                    
+                    file_data = file_response.json()
+                    current_code = base64.b64decode(file_data['content']).decode('utf-8')
+                    
+                    # Исправляем код через агента-разработчика
+                    logger.info(f"🔧 Исправление кода файла {file_path}...")
+                    fix_result = agno_system.fix_code(
+                        technical_spec=current_spec,
+                        file_path=file_path,
+                        current_code=current_code,
+                        repository_name=repo_full_name
+                    )
+                    
+                    if not fix_result.get('success'):
+                        logger.error(f"❌ Ошибка при исправлении файла {file_path}: {fix_result.get('error')}")
+                        failed_files.append({'file': file_path, 'error': fix_result.get('error')})
+                        continue
+                    
+                    fixed_code = fix_result.get('fixed_code', '')
+                    
+                    # Обновляем файл в ветке
+                    logger.info(f"📝 Обновление файла {file_path} в ветке {branch_name}...")
+                    
+                    # Получаем SHA файла в ветке (или создаем новый)
+                    file_branch_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={branch_name}'
+                    file_branch_response = requests.get(file_branch_url, headers=headers)
+                    
+                    file_sha = None
+                    if file_branch_response.status_code == 200:
+                        file_sha = file_branch_response.json()['sha']
+                    elif file_branch_response.status_code == 404:
+                        # Файл не существует в ветке, создаем новый
+                        file_sha = None
+                    else:
+                        raise Exception(f"Не удалось проверить файл в ветке: {file_branch_response.status_code}")
+                    
+                    update_file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}'
+                    update_data = {
+                        'message': f'Fix: исправление для issue #{issue_number} (итерация {iteration})',
+                        'content': base64.b64encode(fixed_code.encode('utf-8')).decode('utf-8'),
+                        'branch': branch_name
+                    }
+                    
+                    if file_sha:
+                        update_data['sha'] = file_sha
+                    
+                    update_response = requests.put(update_file_url, headers=headers, json=update_data)
+                    
+                    if update_response.status_code not in [200, 201]:
+                        raise Exception(f"Не удалось обновить файл: {update_response.status_code} - {update_response.text}")
+                    
+                    logger.info(f"✅ Файл {file_path} обновлен")
+                    fixed_files.append(file_path)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при обработке файла {file_path}: {str(e)}")
+                    failed_files.append({'file': file_path, 'error': str(e)})
+            
+            if not fixed_files:
+                logger.error("❌ Не удалось исправить ни одного файла")
+                if iteration < max_iterations:
+                    logger.info("🔄 Продолжаю с следующей итерацией...")
+                    continue
+                return {
+                    'success': False,
+                    'error': 'Не удалось исправить ни одного файла',
+                    'failed_files': failed_files,
+                    'iteration': iteration
+                }
+            
+            # 8. Запускаем CI после изменений
+            logger.info(f"🧪 Запуск CI после изменений на ветке {branch_name}...")
+            ci_after = run_ci_commands(owner, repo, branch_name, ci_commands, installation_id)
+            
+            if not ci_after.get('success'):
+                logger.warning(f"⚠️ Не удалось запустить CI: {ci_after.get('error')}")
+                ci_after = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+            
+            # 9. Проверяем через Reviewer
+            logger.info(f"👀 Проверка изменений через Reviewer...")
+            review_result = agno_system.review_changes(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                technical_spec=current_spec,
+                changed_files=fixed_files,
+                ci_before=ci_before,
+                ci_after=ci_after,
+                repository_name=repo_full_name
+            )
+            
+            if review_result.get('success') and review_result.get('approved'):
+                logger.info(f"✅ Reviewer одобрил изменения!")
+                
+                # Создаем Pull Request
+                logger.info(f"🔀 Создание Pull Request...")
+                pr_result = create_pr_from_branch(
+                    owner=owner,
+                    repo=repo,
+                    branch_name=branch_name,
+                    default_branch=default_branch,
+                    issue_number=issue_number,
+                    technical_spec=current_spec,
+                    fixed_files=fixed_files,
+                    failed_files=failed_files,
+                    installation_id=installation_id
+                )
+                
+                return {
+                    'success': True,
+                    'pr_number': pr_result.get('pr_number'),
+                    'pr_url': pr_result.get('pr_url'),
+                    'branch': branch_name,
+                    'fixed_files': fixed_files,
+                    'failed_files': failed_files,
+                    'iteration': iteration,
+                    'review': review_result
+                }
+            else:
+                logger.warning(f"❌ Reviewer не одобрил изменения: {review_result.get('reason', 'Не указана причина')}")
+                
+                if iteration >= max_iterations:
+                    logger.error(f"❌ Достигнуто максимальное количество итераций ({max_iterations})")
+                    return {
+                        'success': False,
+                        'error': f'Не удалось получить одобрение Reviewer после {max_iterations} итераций',
+                        'review': review_result,
+                        'iteration': iteration
+                    }
+                
+                # Создаем новое ТЗ на основе проблем от Reviewer
+                logger.info(f"📝 Создание уточненного технического задания на основе замечаний Reviewer...")
+                issues_text = "\n".join([f"- {issue}" for issue in review_result.get('issues', [])])
+                recommendations_text = "\n".join([f"- {rec}" for rec in review_result.get('recommendations', [])])
+                
+                refinement_prompt = f"""
+ПРЕДЫДУЩЕЕ ТЕХНИЧЕСКОЕ ЗАДАНИЕ:
+{current_spec}
+
+ИСХОДНАЯ ЗАДАЧА:
+Название: {issue_title}
+Описание: {issue_body}
+
+ПРОБЛЕМЫ, ВЫЯВЛЕННЫЕ REVIEWER:
+{issues_text if issues_text else 'Не указаны'}
+
+РЕКОМЕНДАЦИИ REVIEWER:
+{recommendations_text if recommendations_text else 'Не указаны'}
+
+РЕЗУЛЬТАТЫ CI:
+Сборка до: {'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}
+Сборка после: {'✅' if ci_after.get('summary', {}).get('build_passed') else '❌'}
+Тесты до: {'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}
+Тесты после: {'✅' if ci_after.get('summary', {}).get('test_passed') else '❌'}
+
+Создай уточненное техническое задание, которое учитывает замечания Reviewer и исправляет выявленные проблемы.
+"""
+                
+                refinement_result = agno_system.analyzer.client.chat.completions.create(
+                    model=agno_system.analyzer.model,
+                    messages=[
+                        {"role": "system", "content": agno_system.analyzer.instructions},
+                        {"role": "user", "content": refinement_prompt}
+                    ],
+                    temperature=0
+                )
+                
+                current_spec = refinement_result.choices[0].message.content
+                logger.info(f"📋 Создано уточненное ТЗ (длина: {len(current_spec)} символов)")
+                logger.info(f"🔄 Переход к следующей итерации...")
+                continue
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка на итерации {iteration}: {str(e)}")
+            if iteration >= max_iterations:
+                return {
+                    'success': False,
+                    'error': str(e),
+                    'iteration': iteration
+                }
+            continue
+    
+    return {
+        'success': False,
+        'error': f'Достигнуто максимальное количество итераций ({max_iterations})',
+        'iteration': max_iterations
+    }
+
+def create_pr_from_branch(owner, repo, branch_name, default_branch, issue_number, 
+                          technical_spec, fixed_files, failed_files, installation_id=None):
+    """Создает Pull Request из существующей ветки"""
+    try:
+        if installation_id:
+            access_token = get_installation_access_token(installation_id)
+            headers = {
+                'Authorization': f'token {access_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        else:
+            personal_token = os.getenv('GITHUB_TOKEN')
+            if not personal_token:
+                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+            headers = {
+                'Authorization': f'token {personal_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        
+        pr_url = f'https://api.github.com/repos/{owner}/{repo}/pulls'
+        
+        pr_title = f"Fix: решение для issue #{issue_number}"
+        files_list = '\n'.join([f"- `{f}`" for f in fixed_files])
+        pr_body = f"""## Описание
+Этот PR решает issue #{issue_number}
+
+## Изменения
+{files_list}
+
+## Техническое задание
+{technical_spec[:2000]}{'...' if len(technical_spec) > 2000 else ''}
+
+## Связанная issue
+Closes #{issue_number}
+"""
+        
+        if failed_files:
+            pr_body += f"\n## Предупреждения\nНе удалось обработать следующие файлы:\n"
+            for failed in failed_files:
+                pr_body += f"- `{failed['file']}`: {failed['error']}\n"
+        
+        pr_data = {
+            'title': pr_title,
+            'body': pr_body,
+            'head': branch_name,
+            'base': default_branch
+        }
+        
+        pr_response = requests.post(pr_url, headers=headers, json=pr_data)
+        
+        if pr_response.status_code not in [201, 422]:
+            if pr_response.status_code == 422:
+                # PR уже существует, получаем его
+                existing_prs_url = f'https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch_name}&state=open'
+                existing_prs_response = requests.get(existing_prs_url, headers=headers)
+                if existing_prs_response.status_code == 200:
+                    existing_prs = existing_prs_response.json()
+                    if existing_prs:
+                        pr_data = existing_prs[0]
+                        logger.info(f"ℹ️  PR уже существует: {pr_data['html_url']}")
+                        return {
+                            'success': True,
+                            'pr_number': pr_data['number'],
+                            'pr_url': pr_data['html_url'],
+                            'branch': branch_name
+                        }
+            raise Exception(f"Не удалось создать PR: {pr_response.status_code} - {pr_response.text}")
+        
+        pr_data = pr_response.json()
+        logger.info(f"✅ Pull Request создан: {pr_data['html_url']}")
+        
+        return {
+            'success': True,
+            'pr_number': pr_data['number'],
+            'pr_url': pr_data['html_url'],
+            'branch': branch_name
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при создании PR: {str(e)}")
+        raise
 
 def auto_fix_and_create_pr(owner, repo, issue_number, technical_spec, installation_id=None):
     """
@@ -735,6 +1151,417 @@ Closes #{issue_number}
         logger.error(f"❌ Ошибка при создании PR: {str(e)}")
         raise
 
+def get_repository_structure(owner, repo, branch='main', installation_id=None, max_depth=2):
+    """
+    Получает структуру репозитория (список файлов и директорий)
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        branch: Ветка (по умолчанию main)
+        installation_id: ID установки GitHub App
+        max_depth: Максимальная глубина для анализа
+        
+    Returns:
+        dict с информацией о структуре репозитория
+    """
+    try:
+        if installation_id:
+            access_token = get_installation_access_token(installation_id)
+            headers = {
+                'Authorization': f'token {access_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        else:
+            personal_token = os.getenv('GITHUB_TOKEN')
+            if not personal_token:
+                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+            headers = {
+                'Authorization': f'token {personal_token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        
+        # Получаем дерево репозитория
+        repo_url = f'https://api.github.com/repos/{owner}/{repo}'
+        repo_response = requests.get(repo_url, headers=headers)
+        
+        if repo_response.status_code != 200:
+            raise Exception(f"Не удалось получить информацию о репозитории: {repo_response.status_code}")
+        
+        repo_data = repo_response.json()
+        default_branch = repo_data.get('default_branch', branch)
+        
+        # Получаем SHA последнего коммита
+        ref_url = f'https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}'
+        ref_response = requests.get(ref_url, headers=headers)
+        
+        if ref_response.status_code != 200:
+            raise Exception(f"Не удалось получить информацию о ветке {default_branch}: {ref_response.status_code}")
+        
+        commit_sha = ref_response.json()['object']['sha']
+        
+        # Получаем дерево коммита
+        tree_url = f'https://api.github.com/repos/{owner}/{repo}/git/trees/{commit_sha}?recursive=1'
+        tree_response = requests.get(tree_url, headers=headers)
+        
+        if tree_response.status_code != 200:
+            raise Exception(f"Не удалось получить дерево репозитория: {tree_response.status_code}")
+        
+        tree_data = tree_response.json()
+        files = []
+        
+        for item in tree_data.get('tree', []):
+            if item['type'] == 'blob':  # файл
+                path = item['path']
+                depth = path.count('/')
+                if depth <= max_depth or any(path.startswith(p) for p in ['package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod', 'Makefile', 'Dockerfile', '.github']):
+                    files.append({
+                        'path': path,
+                        'type': 'file',
+                        'size': item.get('size', 0)
+                    })
+            elif item['type'] == 'tree':  # директория
+                path = item['path']
+                depth = path.count('/')
+                if depth <= max_depth:
+                    files.append({
+                        'path': path,
+                        'type': 'directory'
+                    })
+        
+        # Получаем содержимое ключевых файлов для определения типа проекта
+        key_files = {}
+        for file_path in ['package.json', 'requirements.txt', 'pom.xml', 'build.gradle', 'Cargo.toml', 'go.mod', 'Makefile', 'Dockerfile', 'setup.py', 'pyproject.toml']:
+            for item in tree_data.get('tree', []):
+                if item['type'] == 'blob' and item['path'] == file_path:
+                    # Получаем содержимое файла
+                    file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{file_path}?ref={default_branch}'
+                    file_response = requests.get(file_url, headers=headers)
+                    if file_response.status_code == 200:
+                        file_data = file_response.json()
+                        content = base64.b64decode(file_data['content']).decode('utf-8')
+                        key_files[file_path] = content[:5000]  # Ограничиваем размер
+                    break
+        
+        return {
+            'success': True,
+            'files': files,
+            'key_files': key_files,
+            'language': repo_data.get('language', ''),
+            'default_branch': default_branch
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при получении структуры репозитория: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e),
+            'files': [],
+            'key_files': {}
+        }
+
+def determine_ci_commands(owner, repo, installation_id=None):
+    """
+    Определяет команды для сборки, тестов и проверки качества кода на основе структуры репозитория
+    
+    Returns:
+        dict с командами для CI
+    """
+    try:
+        logger.info(f"🔍 Анализирую репозиторий {owner}/{repo} для определения CI команд...")
+        
+        # Получаем структуру репозитория
+        repo_structure = get_repository_structure(owner, repo, installation_id=installation_id)
+        
+        if not repo_structure.get('success'):
+            return {
+                'success': False,
+                'error': repo_structure.get('error', 'Не удалось получить структуру репозитория')
+            }
+        
+        key_files = repo_structure.get('key_files', {})
+        files = repo_structure.get('files', [])
+        language = repo_structure.get('language', '')
+        
+        # Используем AI для определения команд
+        files_info = "\n".join([f"- {f['path']} ({f['type']})" for f in files[:50]])  # Первые 50 файлов
+        key_files_info = "\n".join([f"### {name}\n{content[:1000]}" for name, content in key_files.items()])
+        
+        prompt = f"""
+РЕПОЗИТОРИЙ: {owner}/{repo}
+ЯЗЫК: {language}
+
+СТРУКТУРА РЕПОЗИТОРИЯ:
+{files_info}
+
+КЛЮЧЕВЫЕ ФАЙЛЫ:
+{key_files_info}
+
+Проанализируй структуру репозитория и определи команды для:
+1. Сборки проекта (build command)
+2. Запуска тестов (test command)
+3. Проверки качества кода (code quality command, опционально)
+
+Верни JSON объект в формате:
+{{
+    "build_command": "команда для сборки или null",
+    "test_command": "команда для запуска тестов или null",
+    "quality_command": "команда для проверки качества кода или null",
+    "working_directory": "директория для выполнения команд или ."
+}}
+
+Отвечай ТОЛЬКО JSON объектом, без дополнительных комментариев.
+"""
+        
+        # Используем агента-аналитика для определения команд
+        response = agno_system.analyzer.client.chat.completions.create(
+            model=agno_system.analyzer.model,
+            messages=[
+                {"role": "system", "content": "Ты помощник, который анализирует структуру репозитория и определяет команды для сборки, тестов и проверки качества кода. Отвечай только JSON объектом."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0
+        )
+        
+        commands_text = response.choices[0].message.content.strip()
+        
+        # Извлекаем JSON
+        if "```json" in commands_text:
+            commands_text = commands_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in commands_text:
+            commands_text = commands_text.split("```")[1].split("```")[0].strip()
+        
+        import json
+        try:
+            commands = json.loads(commands_text)
+            logger.info(f"✅ Определены CI команды: {commands}")
+            return {
+                'success': True,
+                'commands': commands
+            }
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ Не удалось распарсить JSON: {e}. Ответ: {commands_text}")
+            # Пытаемся определить команды эвристически
+            return determine_ci_commands_heuristic(key_files, language, files)
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при определении CI команд: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+def determine_ci_commands_heuristic(key_files, language, files):
+    """Эвристическое определение команд CI на основе известных паттернов"""
+    commands = {
+        'build_command': None,
+        'test_command': None,
+        'quality_command': None,
+        'working_directory': '.'
+    }
+    
+    # Python
+    if 'requirements.txt' in key_files or 'setup.py' in key_files or 'pyproject.toml' in key_files:
+        commands['build_command'] = 'pip install -r requirements.txt' if 'requirements.txt' in key_files else 'pip install -e .'
+        commands['test_command'] = 'pytest' if any('pytest' in f['path'] or 'test' in f['path'].lower() for f in files) else 'python -m unittest discover'
+        commands['quality_command'] = 'pylint . || true'  # || true чтобы не падало на ошибках
+    
+    # Node.js
+    elif 'package.json' in key_files:
+        commands['build_command'] = 'npm install'
+        commands['test_command'] = 'npm test'
+        commands['quality_command'] = 'npm run lint || true'
+    
+    # Java (Maven)
+    elif 'pom.xml' in key_files:
+        commands['build_command'] = 'mvn clean compile'
+        commands['test_command'] = 'mvn test'
+        commands['quality_command'] = 'mvn checkstyle:check || true'
+    
+    # Java (Gradle)
+    elif 'build.gradle' in key_files:
+        commands['build_command'] = './gradlew build'
+        commands['test_command'] = './gradlew test'
+        commands['quality_command'] = './gradlew check || true'
+    
+    # Rust
+    elif 'Cargo.toml' in key_files:
+        commands['build_command'] = 'cargo build'
+        commands['test_command'] = 'cargo test'
+        commands['quality_command'] = 'cargo clippy || true'
+    
+    # Go
+    elif 'go.mod' in key_files:
+        commands['build_command'] = 'go build ./...'
+        commands['test_command'] = 'go test ./...'
+        commands['quality_command'] = 'golangci-lint run || true'
+    
+    # Makefile
+    if any(f['path'] == 'Makefile' for f in files):
+        commands['build_command'] = 'make build' if commands['build_command'] is None else commands['build_command']
+        commands['test_command'] = 'make test' if commands['test_command'] is None else commands['test_command']
+    
+    return {
+        'success': True,
+        'commands': commands
+    }
+
+def run_ci_commands(owner, repo, branch, commands, installation_id=None):
+    """
+    Клонирует репозиторий и запускает CI команды локально
+    
+    Args:
+        owner: Владелец репозитория
+        repo: Название репозитория
+        branch: Ветка для клонирования
+        commands: dict с командами (build_command, test_command, quality_command)
+        installation_id: ID установки GitHub App
+        
+    Returns:
+        dict с результатами выполнения CI
+    """
+    temp_dir = None
+    try:
+        logger.info(f"🔧 Запуск CI для {owner}/{repo} (ветка: {branch})...")
+        
+        # Создаем временную директорию
+        temp_dir = tempfile.mkdtemp()
+        logger.info(f"📁 Временная директория: {temp_dir}")
+        
+        # Получаем access token для клонирования
+        if installation_id:
+            access_token = get_installation_access_token(installation_id)
+            clone_url = f'https://x-access-token:{access_token}@github.com/{owner}/{repo}.git'
+        else:
+            personal_token = os.getenv('GITHUB_TOKEN')
+            if not personal_token:
+                raise ValueError("Необходим либо GITHUB_INSTALLATION_ID, либо GITHUB_TOKEN")
+            clone_url = f'https://x-access-token:{personal_token}@github.com/{owner}/{repo}.git'
+        
+        # Клонируем репозиторий
+        logger.info(f"📥 Клонирование репозитория...")
+        clone_result = subprocess.run(
+            ['git', 'clone', '--depth', '1', '--branch', branch, clone_url, temp_dir],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        if clone_result.returncode != 0:
+            raise Exception(f"Ошибка клонирования репозитория: {clone_result.stderr}")
+        
+        logger.info(f"✅ Репозиторий клонирован")
+        
+        # Переходим в директорию проекта
+        working_dir = commands.get('working_directory', '.')
+        if working_dir != '.':
+            work_path = os.path.join(temp_dir, working_dir)
+        else:
+            work_path = temp_dir
+        
+        results = {
+            'build': {'success': None, 'output': '', 'error': ''},
+            'test': {'success': None, 'output': '', 'error': ''},
+            'quality': {'success': None, 'output': '', 'error': ''}
+        }
+        
+        # Запускаем команду сборки
+        if commands.get('build_command'):
+            logger.info(f"🔨 Запуск сборки: {commands['build_command']}")
+            build_result = subprocess.run(
+                commands['build_command'],
+                shell=True,
+                cwd=work_path,
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+            results['build'] = {
+                'success': build_result.returncode == 0,
+                'output': build_result.stdout,
+                'error': build_result.stderr,
+                'returncode': build_result.returncode
+            }
+            if build_result.returncode == 0:
+                logger.info(f"✅ Сборка успешна")
+            else:
+                logger.warning(f"⚠️ Сборка завершилась с ошибкой: {build_result.returncode}")
+        
+        # Запускаем тесты
+        if commands.get('test_command'):
+            logger.info(f"🧪 Запуск тестов: {commands['test_command']}")
+            test_result = subprocess.run(
+                commands['test_command'],
+                shell=True,
+                cwd=work_path,
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+            results['test'] = {
+                'success': test_result.returncode == 0,
+                'output': test_result.stdout,
+                'error': test_result.stderr,
+                'returncode': test_result.returncode
+            }
+            if test_result.returncode == 0:
+                logger.info(f"✅ Тесты прошли успешно")
+            else:
+                logger.warning(f"⚠️ Тесты завершились с ошибкой: {test_result.returncode}")
+        
+        # Запускаем проверку качества кода (опционально)
+        if commands.get('quality_command'):
+            logger.info(f"📊 Запуск проверки качества: {commands['quality_command']}")
+            quality_result = subprocess.run(
+                commands['quality_command'],
+                shell=True,
+                cwd=work_path,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            results['quality'] = {
+                'success': quality_result.returncode == 0,
+                'output': quality_result.stdout,
+                'error': quality_result.stderr,
+                'returncode': quality_result.returncode
+            }
+            if quality_result.returncode == 0:
+                logger.info(f"✅ Проверка качества прошла успешно")
+            else:
+                logger.info(f"ℹ️ Проверка качества завершилась с предупреждениями (это нормально)")
+        
+        return {
+            'success': True,
+            'results': results,
+            'summary': {
+                'build_passed': results['build']['success'] if results['build']['success'] is not None else True,
+                'test_passed': results['test']['success'] if results['test']['success'] is not None else True,
+                'quality_passed': results['quality']['success'] if results['quality']['success'] is not None else None
+            }
+        }
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ Превышено время ожидания выполнения CI команд")
+        return {
+            'success': False,
+            'error': 'Превышено время ожидания выполнения CI команд'
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка при выполнении CI команд: {str(e)}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+    finally:
+        # Удаляем временную директорию
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"🗑️ Временная директория удалена")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось удалить временную директорию: {str(e)}")
+
 def get_repository_name(owner, repo, installation_id=None):
     """
     Получает название репозитория через GitHub API
@@ -946,21 +1773,65 @@ def analyze_issue():
                 logger.info(technical_spec)
                 logger.info("=" * 80 + "\n")
                 
-                # Автоматически исправляем код и создаем PR
-                logger.info("🚀 Запускаю автоматическое исправление кода и создание PR...")
+                # Запускаем CI анализ репозитория
+                logger.info("🔍 Анализирую репозиторий и определяю CI команды...")
+                ci_commands_result = determine_ci_commands(owner, repo, installation_id)
+                
+                if not ci_commands_result.get('success'):
+                    logger.warning(f"⚠️ Не удалось определить CI команды: {ci_commands_result.get('error')}")
+                    ci_commands = {}
+                    ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                else:
+                    ci_commands = ci_commands_result.get('commands', {})
+                    logger.info(f"✅ Определены CI команды: {ci_commands}")
+                    
+                    # Запускаем CI на основной ветке (до изменений)
+                    logger.info("🧪 Запуск CI на основной ветке (до изменений)...")
+                    repo_url = f'https://api.github.com/repos/{owner}/{repo}'
+                    if installation_id:
+                        access_token = get_installation_access_token(installation_id)
+                        repo_headers = {
+                            'Authorization': f'token {access_token}',
+                            'Accept': 'application/vnd.github.v3+json'
+                        }
+                    else:
+                        personal_token = os.getenv('GITHUB_TOKEN')
+                        repo_headers = {
+                            'Authorization': f'token {personal_token}',
+                            'Accept': 'application/vnd.github.v3+json'
+                        }
+                    repo_response = requests.get(repo_url, headers=repo_headers)
+                    default_branch = 'main'
+                    if repo_response.status_code == 200:
+                        default_branch = repo_response.json().get('default_branch', 'main')
+                    
+                    ci_before = run_ci_commands(owner, repo, default_branch, ci_commands, installation_id)
+                    if not ci_before.get('success'):
+                        logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
+                        ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                    else:
+                        logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                
+                # Автоматически исправляем код, проверяем через Reviewer и создаем PR
+                logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
                 try:
-                    pr_result = auto_fix_and_create_pr(
+                    pr_result = auto_fix_and_create_pr_with_review(
                         owner=owner,
                         repo=repo,
                         issue_number=issue_number,
+                        issue_title=issue_title,
+                        issue_body=issue_body,
                         technical_spec=technical_spec,
-                        installation_id=installation_id
+                        ci_commands=ci_commands,
+                        ci_before=ci_before,
+                        installation_id=installation_id,
+                        max_iterations=10
                     )
                     
                     if pr_result.get('success'):
-                        logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')}")
+                        logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')} (итераций: {pr_result.get('iteration', 1)})")
                     else:
-                        logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')}")
+                        logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')} (итераций: {pr_result.get('iteration', 0)})")
                 except Exception as e:
                     logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
                     pr_result = None
@@ -999,11 +1870,31 @@ def analyze_issue():
                 'number': pr_result.get('pr_number'),
                 'url': pr_result.get('pr_url'),
                 'branch': pr_result.get('branch'),
-                'fixed_files': pr_result.get('fixed_files', [])
+                'fixed_files': pr_result.get('fixed_files', []),
+                'iteration': pr_result.get('iteration', 1)
             }
-            response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")}'
+            if pr_result.get('review'):
+                response_data['review'] = {
+                    'approved': pr_result['review'].get('approved'),
+                    'reason': pr_result['review'].get('reason')
+                }
+            response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")} (итераций: {pr_result.get("iteration", 1)})'
         elif pr_result:
             response_data['pr_error'] = pr_result.get('error')
+            response_data['pr_iteration'] = pr_result.get('iteration', 0)
+            if pr_result.get('review'):
+                response_data['review'] = {
+                    'approved': pr_result['review'].get('approved'),
+                    'reason': pr_result['review'].get('reason'),
+                    'issues': pr_result['review'].get('issues', [])
+                }
+        
+        if 'ci_before' in locals() and ci_before:
+            response_data['ci_before'] = {
+                'build_passed': ci_before.get('summary', {}).get('build_passed'),
+                'test_passed': ci_before.get('summary', {}).get('test_passed'),
+                'quality_passed': ci_before.get('summary', {}).get('quality_passed')
+            }
         
         return jsonify(response_data)
         
@@ -1085,36 +1976,80 @@ def webhook():
                     logger.info(technical_spec)
                     logger.info("=" * 80 + "\n")
                     
-                    # Автоматически исправляем код и создаем PR
-                    logger.info("🚀 Запускаю автоматическое исправление кода и создание PR...")
-                    try:
-                        # Извлекаем owner и repo из repo_full_name
-                        repo_parts = repo_full_name.split('/')
-                        if len(repo_parts) == 2:
-                            repo_owner = repo_parts[0]
-                            repo_repo = repo_parts[1]
+                    # Извлекаем owner и repo из repo_full_name
+                    repo_parts = repo_full_name.split('/')
+                    if len(repo_parts) == 2:
+                        repo_owner = repo_parts[0]
+                        repo_repo = repo_parts[1]
+                    else:
+                        raise ValueError(f"Неверный формат repo_full_name: {repo_full_name}")
+                    
+                    # Получаем installation_id из payload
+                    installation_id = payload.get('installation', {}).get('id')
+                    if not installation_id:
+                        installation_id = find_installation_id_for_repo(repo_owner, repo_repo)
+                    if not installation_id:
+                        installation_id = GITHUB_INSTALLATION_ID or None
+                    
+                    # Запускаем CI анализ репозитория
+                    logger.info("🔍 Анализирую репозиторий и определяю CI команды...")
+                    ci_commands_result = determine_ci_commands(repo_owner, repo_repo, installation_id)
+                    
+                    if not ci_commands_result.get('success'):
+                        logger.warning(f"⚠️ Не удалось определить CI команды: {ci_commands_result.get('error')}")
+                        ci_commands = {}
+                        ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                    else:
+                        ci_commands = ci_commands_result.get('commands', {})
+                        logger.info(f"✅ Определены CI команды: {ci_commands}")
+                        
+                        # Запускаем CI на основной ветке (до изменений)
+                        logger.info("🧪 Запуск CI на основной ветке (до изменений)...")
+                        repo_url = f'https://api.github.com/repos/{repo_owner}/{repo_repo}'
+                        if installation_id:
+                            access_token = get_installation_access_token(installation_id)
+                            repo_headers = {
+                                'Authorization': f'token {access_token}',
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
                         else:
-                            raise ValueError(f"Неверный формат repo_full_name: {repo_full_name}")
+                            personal_token = os.getenv('GITHUB_TOKEN')
+                            repo_headers = {
+                                'Authorization': f'token {personal_token}',
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                        repo_response = requests.get(repo_url, headers=repo_headers)
+                        default_branch = 'main'
+                        if repo_response.status_code == 200:
+                            default_branch = repo_response.json().get('default_branch', 'main')
                         
-                        # Получаем installation_id из payload
-                        installation_id = payload.get('installation', {}).get('id')
-                        if not installation_id:
-                            installation_id = find_installation_id_for_repo(repo_owner, repo_repo)
-                        if not installation_id:
-                            installation_id = GITHUB_INSTALLATION_ID or None
-                        
-                        pr_result = auto_fix_and_create_pr(
+                        ci_before = run_ci_commands(repo_owner, repo_repo, default_branch, ci_commands, installation_id)
+                        if not ci_before.get('success'):
+                            logger.warning(f"⚠️ Не удалось запустить CI до изменений: {ci_before.get('error')}")
+                            ci_before = {'summary': {'build_passed': None, 'test_passed': None, 'quality_passed': None}}
+                        else:
+                            logger.info(f"✅ CI до изменений: сборка={'✅' if ci_before.get('summary', {}).get('build_passed') else '❌'}, тесты={'✅' if ci_before.get('summary', {}).get('test_passed') else '❌'}")
+                    
+                    # Автоматически исправляем код, проверяем через Reviewer и создаем PR
+                    logger.info("🚀 Запускаю автоматическое исправление кода с проверкой через Reviewer...")
+                    try:
+                        pr_result = auto_fix_and_create_pr_with_review(
                             owner=repo_owner,
                             repo=repo_repo,
                             issue_number=issue_number,
+                            issue_title=issue_title,
+                            issue_body=issue_body,
                             technical_spec=technical_spec,
-                            installation_id=installation_id
+                            ci_commands=ci_commands,
+                            ci_before=ci_before,
+                            installation_id=installation_id,
+                            max_iterations=10
                         )
                         
                         if pr_result.get('success'):
-                            logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')}")
+                            logger.info(f"✅ Автоматическое исправление завершено успешно: {pr_result.get('pr_url')} (итераций: {pr_result.get('iteration', 1)})")
                         else:
-                            logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')}")
+                            logger.warning(f"⚠️ Автоматическое исправление не удалось: {pr_result.get('error')} (итераций: {pr_result.get('iteration', 0)})")
                     except Exception as e:
                         logger.error(f"❌ Ошибка при автоматическом исправлении: {str(e)}")
                         pr_result = None
@@ -1122,11 +2057,13 @@ def webhook():
                     logger.error(f"⚠️ Ошибка при создании ТЗ: {analysis_result.get('error', 'Неизвестная ошибка')}")
                     technical_spec = None
                     pr_result = None
+                    ci_before = None
                     
             except Exception as e:
                 logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
                 technical_spec = None
                 pr_result = None
+                ci_before = None
             
             response_data = {
                 'success': True,
@@ -1150,11 +2087,31 @@ def webhook():
                     'number': pr_result.get('pr_number'),
                     'url': pr_result.get('pr_url'),
                     'branch': pr_result.get('branch'),
-                    'fixed_files': pr_result.get('fixed_files', [])
+                    'fixed_files': pr_result.get('fixed_files', []),
+                    'iteration': pr_result.get('iteration', 1)
                 }
-                response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")}'
+                if pr_result.get('review'):
+                    response_data['review'] = {
+                        'approved': pr_result['review'].get('approved'),
+                        'reason': pr_result['review'].get('reason')
+                    }
+                response_data['message'] += f'. Pull Request создан: {pr_result.get("pr_url")} (итераций: {pr_result.get("iteration", 1)})'
             elif pr_result:
                 response_data['pr_error'] = pr_result.get('error')
+                response_data['pr_iteration'] = pr_result.get('iteration', 0)
+                if pr_result.get('review'):
+                    response_data['review'] = {
+                        'approved': pr_result['review'].get('approved'),
+                        'reason': pr_result['review'].get('reason'),
+                        'issues': pr_result['review'].get('issues', [])
+                    }
+            
+            if ci_before:
+                response_data['ci_before'] = {
+                    'build_passed': ci_before.get('summary', {}).get('build_passed'),
+                    'test_passed': ci_before.get('summary', {}).get('test_passed'),
+                    'quality_passed': ci_before.get('summary', {}).get('quality_passed')
+                }
             
             return jsonify(response_data)
         
