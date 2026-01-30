@@ -1,9 +1,11 @@
 import os
+import sys
 import jwt
 import time
 import hmac
 import hashlib
 import re
+import logging
 import requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
@@ -12,6 +14,22 @@ from issue_analyzer import analyze_issue_to_spec
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    stream=sys.stdout,
+    force=True  # Переопределяем существующую конфигурацию
+)
+
+# Создаем логгер для приложения
+logger = logging.getLogger('github-app')
+logger.setLevel(logging.INFO)
+
+# Настройка Flask логирования
+logging.getLogger('werkzeug').setLevel(logging.INFO)
 
 app = Flask(__name__)
 
@@ -74,7 +92,7 @@ def find_installation_id_for_repo(owner, repo):
     """
     try:
         if not GITHUB_APP_ID or not GITHUB_APP_PRIVATE_KEY:
-            print("⚠️  GitHub App не настроен, пропускаю поиск installation_id")
+            logger.warning("⚠️  GitHub App не настроен, пропускаю поиск installation_id")
             return None
         
         app_token = get_github_app_token()
@@ -88,7 +106,7 @@ def find_installation_id_for_repo(owner, repo):
         response = requests.get(url, headers=headers)
         
         if response.status_code != 200:
-            print(f"⚠️  Не удалось получить список установок: {response.status_code}")
+            logger.warning(f"⚠️  Не удалось получить список установок: {response.status_code}")
             return None
         
         installations = response.json()
@@ -110,18 +128,18 @@ def find_installation_id_for_repo(owner, repo):
                 repo_response = requests.get(repo_url, headers=repo_headers)
                 
                 if repo_response.status_code == 200:
-                    print(f"✅ Найдена установка #{installation_id} для репозитория {owner}/{repo}")
+                    logger.info(f"✅ Найдена установка #{installation_id} для репозитория {owner}/{repo}")
                     return installation_id
                     
             except Exception as e:
                 # Пропускаем эту установку, если нет доступа
                 continue
         
-        print(f"⚠️  Не найдена установка для репозитория {owner}/{repo}")
+        logger.warning(f"⚠️  Не найдена установка для репозитория {owner}/{repo}")
         return None
         
     except Exception as e:
-        print(f"⚠️  Ошибка при поиске installation_id: {str(e)}")
+        logger.error(f"⚠️  Ошибка при поиске installation_id: {str(e)}")
         return None
 
 def verify_webhook_signature(payload_body, signature_header):
@@ -129,7 +147,7 @@ def verify_webhook_signature(payload_body, signature_header):
     Проверяет подпись webhook от GitHub используя HMAC SHA256
     """
     if not WEBHOOK_SECRET:
-        print("⚠️  ВНИМАНИЕ: WEBHOOK_SECRET не установлен, проверка подписи пропущена")
+        logger.warning("⚠️  ВНИМАНИЕ: WEBHOOK_SECRET не установлен, проверка подписи пропущена")
         return True  # Если секрет не установлен, пропускаем проверку
     
     if not signature_header:
@@ -312,7 +330,7 @@ def get_repo_info(owner, repo):
         
         # Если не передан, пытаемся найти автоматически
         if not installation_id:
-            print(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
+            logger.info(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
             installation_id = find_installation_id_for_repo(owner, repo)
         
         # Если не нашли автоматически, используем значение из .env (если есть)
@@ -395,31 +413,31 @@ def analyze_issue():
         
         # Если не передан явно, пытаемся найти автоматически
         if not installation_id:
-            print(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
+            logger.info(f"🔍 Автоматический поиск installation_id для {owner}/{repo}...")
             installation_id = find_installation_id_for_repo(owner, repo)
         
         # Если не нашли автоматически, используем значение из .env (если есть)
         if not installation_id:
             installation_id = GITHUB_INSTALLATION_ID or None
         
-        print(f"🔍 Получение данных issue #{issue_number} из {owner}/{repo}...")
+        logger.info(f"🔍 Получение данных issue #{issue_number} из {owner}/{repo}...")
         issue_data = get_issue_data(owner, repo, issue_number, installation_id)
         
         repo_full_name = f"{owner}/{repo}"
         issue_title = issue_data['title']
         issue_body = issue_data['body'] or ''
         
-        # Выводим информацию в консоль
-        print("=" * 80)
-        print(f"📝 АНАЛИЗ ISSUE (прямой запрос)")
-        print(f"📦 Репозиторий: {repo}")
-        print(f"🔗 Полное имя: {repo_full_name}")
-        print(f"#️⃣  Номер issue: #{issue_number}")
-        print(f"📌 Название issue: {issue_title}")
-        print("=" * 80)
+        # Выводим информацию в логи
+        logger.info("=" * 80)
+        logger.info(f"📝 АНАЛИЗ ISSUE (прямой запрос)")
+        logger.info(f"📦 Репозиторий: {repo}")
+        logger.info(f"🔗 Полное имя: {repo_full_name}")
+        logger.info(f"#️⃣  Номер issue: #{issue_number}")
+        logger.info(f"📌 Название issue: {issue_title}")
+        logger.info("=" * 80)
         
         # Анализируем issue и создаем ТЗ
-        print("\n🤖 Анализирую issue и создаю техническое задание...")
+        logger.info("\n🤖 Анализирую issue и создаю техническое задание...")
         try:
             technical_spec = analyze_issue_to_spec(
                 issue_title=issue_title,
@@ -427,15 +445,15 @@ def analyze_issue():
                 repository_name=repo_full_name
             )
             
-            # Выводим ТЗ в консоль
-            print("\n" + "=" * 80)
-            print("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
-            print("=" * 80)
-            print(technical_spec)
-            print("=" * 80 + "\n")
+            # Выводим ТЗ в логи
+            logger.info("\n" + "=" * 80)
+            logger.info("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
+            logger.info("=" * 80)
+            logger.info(technical_spec)
+            logger.info("=" * 80 + "\n")
             
         except Exception as e:
-            print(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
+            logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
             technical_spec = None
         
         return jsonify({
@@ -459,7 +477,7 @@ def analyze_issue():
         })
         
     except Exception as e:
-        print(f"❌ Ошибка при анализе issue: {str(e)}")
+        logger.error(f"❌ Ошибка при анализе issue: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -477,7 +495,7 @@ def webhook():
         # Проверяем подпись webhook
         signature_header = request.headers.get('X-Hub-Signature-256')
         if not verify_webhook_signature(payload_body, signature_header):
-            print("❌ Ошибка: Неверная подпись webhook")
+            logger.error("❌ Ошибка: Неверная подпись webhook")
             return jsonify({
                 'error': 'Неверная подпись webhook'
             }), 401
@@ -486,12 +504,12 @@ def webhook():
         payload = request.json
         event_type = request.headers.get('X-GitHub-Event')
         
-        print(f"📥 Получено событие: {event_type}")
+        logger.info(f"📥 Получено событие: {event_type}")
         
         # Обработка установки GitHub App
         if event_type == 'installation' and payload.get('action') == 'created':
             installation_id = payload['installation']['id']
-            print(f"✅ GitHub App установлен! Installation ID: {installation_id}")
+            logger.info(f"✅ GitHub App установлен! Installation ID: {installation_id}")
             return jsonify({
                 'message': f'GitHub App установлен! Installation ID: {installation_id}',
                 'installation_id': installation_id
@@ -508,17 +526,17 @@ def webhook():
             issue_body = issue.get('body', '')
             issue_number = issue.get('number', '?')
             
-            # Выводим в консоль имя репозитория и название issue
-            print("=" * 60)
-            print(f"📝 СОЗДАНА НОВАЯ ISSUE")
-            print(f"📦 Репозиторий: {repo_name}")
-            print(f"🔗 Полное имя: {repo_full_name}")
-            print(f"#️⃣  Номер issue: #{issue_number}")
-            print(f"📌 Название issue: {issue_title}")
-            print("=" * 60)
+            # Выводим в логи имя репозитория и название issue
+            logger.info("=" * 60)
+            logger.info(f"📝 СОЗДАНА НОВАЯ ISSUE")
+            logger.info(f"📦 Репозиторий: {repo_name}")
+            logger.info(f"🔗 Полное имя: {repo_full_name}")
+            logger.info(f"#️⃣  Номер issue: #{issue_number}")
+            logger.info(f"📌 Название issue: {issue_title}")
+            logger.info("=" * 60)
             
             # Анализируем issue и создаем ТЗ
-            print("\n🤖 Анализирую issue и создаю техническое задание...")
+            logger.info("\n🤖 Анализирую issue и создаю техническое задание...")
             try:
                 technical_spec = analyze_issue_to_spec(
                     issue_title=issue_title,
@@ -527,14 +545,14 @@ def webhook():
                 )
                 
                 # Выводим ТЗ в консоль с красивым форматированием
-                print("\n" + "=" * 80)
-                print("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
-                print("=" * 80)
-                print(technical_spec)
-                print("=" * 80 + "\n")
+                logger.info("\n" + "=" * 80)
+                logger.info("📋 ТЕХНИЧЕСКОЕ ЗАДАНИЕ")
+                logger.info("=" * 80)
+                logger.info(technical_spec)
+                logger.info("=" * 80 + "\n")
                 
             except Exception as e:
-                print(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
+                logger.error(f"⚠️ Ошибка при создании ТЗ: {str(e)}")
                 technical_spec = None
             
             return jsonify({
@@ -560,7 +578,7 @@ def webhook():
             repo_name = repo.get('name')
             repo_full_name = repo.get('full_name')
             
-            print(f"📦 Событие {event_type} для репозитория: {repo_full_name}")
+            logger.info(f"📦 Событие {event_type} для репозитория: {repo_full_name}")
             
             return jsonify({
                 'event': event_type,
@@ -569,13 +587,13 @@ def webhook():
                 'message': f'Получено событие {event_type} для репозитория {repo_full_name}'
             })
         
-        print(f"ℹ️  Необработанное событие: {event_type}")
+        logger.info(f"ℹ️  Необработанное событие: {event_type}")
         return jsonify({
             'event': event_type,
             'message': 'Webhook получен'
         })
     except Exception as e:
-        print(f"❌ Ошибка обработки webhook: {str(e)}")
+        logger.error(f"❌ Ошибка обработки webhook: {str(e)}")
         return jsonify({
             'error': str(e)
         }), 500
@@ -592,4 +610,6 @@ def health():
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
+    logger.info(f"🚀 Запуск GitHub Issue Analyzer Agent на порту {port}")
+    logger.info(f"📡 Сервер будет доступен на http://0.0.0.0:{port}")
     app.run(host='0.0.0.0', port=port, debug=True)
