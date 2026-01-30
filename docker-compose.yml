@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  github-app:
+    build: .
+    container_name: github-app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - PORT=5000
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      # Монтируем .env файл (опционально, если хотите редактировать без пересборки)
+      - ./.env:/app/.env:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
